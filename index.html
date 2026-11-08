@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="KALITEVI : indice de qualité de vie d'un lieu en France, calculé uniquement à partir d'APIs ouvertes et sans clé.">
+<title>KALITEVI – Qualité de vie d'un lieu</title>
+<!-- ============================================================
+     FAVICON : pin de carte SVG inline (data URI), aucune image
+     externe à héberger. Modifier la couleur via fill ci-dessous.
+     ============================================================ -->
+<link rel="icon" type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%230b6e6e'/%3E%3Cpath d='M32 10a16 16 0 0 0-16 16c0 12 16 28 16 28s16-16 16-28a16 16 0 0 0-16-16z' fill='%23ffffff'/%3E%3Ccircle cx='32' cy='26' r='7' fill='%230b6e6e'/%3E%3C/svg%3E">
+<!-- Fond de carte Leaflet : feuille de style officielle via CDN (version épinglée 1.9.4).
+     Pour un usage 100 % hors-ligne : télécharger leaflet.css + leaflet.js et
+     remplacer les deux URLs ci-dessous et en bas de page. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+/* ==================================================================
+   FEUILLE DE STYLE — variables regroupées dans :root pour maintenance
+   ================================================================== */
+:root{
+  --ink:#12292b;   /* couleur principale du texte / entête */
+  --mut:#5b6f70;   /* texte secondaire */
+  --bg:#f1f5f4;    /* fond général et panneau latéral */
+  --card:#fff;     /* fond des cartes/sections */
+  --line:#d6e0de;  /* bordures */
+  --acc:#0b6e6e;   /* couleur accent (teal) : boutons actifs, barres */
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font:14px/1.45 system-ui,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--bg)}
+
+/* --- Barre supérieure : recherche, profil, géoloc, export CSV --- */
+#header{height:56px;background:var(--ink);color:#fff;display:flex;align-items:center;gap:8px;padding:0 14px;flex-wrap:nowrap}
+#header h1{font-size:19px;margin:0 8px 0 0;white-space:nowrap}
+#search{flex:1;min-width:120px;max-width:420px;padding:8px 10px;border:0;border-radius:6px;font:inherit}
+button,select{font:inherit;padding:7px 11px;border:0;border-radius:6px;cursor:pointer;background:#e4eeec;color:var(--ink);white-space:nowrap}
+button:hover{background:#cfe2de}
+:focus-visible{outline:2px solid #5eead4;outline-offset:2px}
+
+/* --- Layout : panneau latéral (gauche) + carte (droite).
+     En mobile (<760px) la carte passe en haut, panneau en bas. --- */
+#wrap{display:flex;height:calc(100% - 56px)}
+#side{width:460px;overflow-y:auto;background:var(--bg);border-right:1px solid var(--line);padding:14px}
+#map{flex:1}
+
+/* --- Composants du panneau --- */
+.hero{display:flex;align-items:center;gap:14px}
+.big{font-size:54px;font-weight:700;line-height:1}.big small{font-size:18px;color:var(--mut);font-weight:400}
+.g{color:#1a9d5b}.o{color:#c98a00}.r{color:#d23f31}      /* vert / orange / rouge du code couleur 80-100 / 50-79 / 0-49 */
+.conf{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:4px 0}.conf i{display:block;height:100%;background:var(--acc)}
+.mut{color:var(--mut);font-size:12px}
+.sec{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px}
+.sec h3{margin:0 0 6px;font-size:14px}
+.th{display:grid;grid-template-columns:104px 1fr 30px;gap:8px;align-items:center;padding:2px 0}
+.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden}.bar i{display:block;height:100%}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
+.chip{padding:4px 10px;border-radius:14px;background:#e4eeec;font-size:13px;cursor:pointer}.chip.on{background:var(--acc);color:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:right;color:var(--mut);font-weight:600;padding:3px 4px}th:first-child{text-align:left}
+td{padding:4px;border-top:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;vertical-align:top}td:first-child{text-align:left}
+tr.na td{color:#9aa9a8}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:2px 0}.kv span:last-child{text-align:right}
+
+/* --- Marqueur "pin" personnalisé (divIcon), orienté -45° --- */
+.pin{width:34px;height:34px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center}
+.pin b{transform:rotate(45deg);color:#fff;font-size:13px}
+
+.msg{padding:8px 10px;border-radius:6px;background:#fff4d6;margin-top:8px;font-size:13px} /* avertissement */
+.ok{color:#1a9d5b}.ko{color:#d23f31}.wait{color:#9aa9a8}                                    /* statuts sources */
+.leg{display:flex;gap:12px;margin-top:6px;font-size:12px;color:var(--mut)}                  /* légende scores */
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:-1px}
+.cmp-score{font-weight:700}
+#loadlist div{padding:2px 0;font-size:13px}
+@media(max-width:760px){#wrap{flex-direction:column-reverse}#side{width:100%;height:55%}#map{height:45%;flex:none}#header h1{display:none}}
+</style>
+</head>
+<body>
+<!-- ======================= BARRE SUPÉRIEURE ======================= -->
+<div id="header">
+<h1>KALITEVI</h1>
+<input id="search" list="sugg" placeholder="Ville ou adresse en France…" autocomplete="off" aria-label="Rechercher un lieu">
+<datalist id="sugg"></datalist>
+<button id="bGo">Chercher</button>
+<button id="bGeo">Ma position</button>
+<select id="prof" aria-label="Profil">
+  <option>Équilibré</option><option>Famille</option><option>Senior</option><option>Étudiant</option>
+</select>
+<button id="bCsv" title="Exporter les indicateurs du lieu courant en CSV">CSV</button>
+</div>
+
+<!-- ======================= LAYOUT PRINCIPAL ======================= -->
+<div id="wrap">
+  <div id="side">
+    <div id="summary">
+      <div class="big">--</div>
+      <p class="mut">Cherchez une ville ou cliquez sur la carte. Le profil (en haut) ajuste les pondérations.</p>
+      <div class="leg"><span><span class="dot" style="background:#1a9d5b"></span>Excellent 80-100</span><span><span class="dot" style="background:#d99a00"></span>Moyen 50-79</span><span><span class="dot" style="background:#d23f31"></span>Faible 0-49</span></div>
+    </div>
+    <div id="detail"></div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+"use strict";
+/* ======================================================================
+   KALITEVI — indice de qualité de vie 0-100, 100 % APIs ouvertes sans clé
+   ======================================================================
+
+   ARCHITECTURE (fichier unique, aucune dépendance hors Leaflet) :
+
+     1) CONFIGURATION  : thèmes, indicateurs, profils, miroirs Overpass, fonds de carte.
+     2) UTILITAIRES     : fetch avec timeout/abort, distances, helpers.
+     3) CARTE          : Leaflet, fonds IGN/OSM, marqueurs, POI, historique.
+     4) SOURCES         : une fonction par API ouverte (voir tableau plus bas).
+     5) SCORE           : compute() agrège tout en scores indicateur/thème/global.
+     6) RENDU           : render() reconstruit le panneau latéral.
+     7) CHARGEMENT      : load() orchestre les appels + affichage progressif.
+     8) RECHERCHE       : géocodage IGN → geo.api.gouv → Nominatim (fallback).
+
+   SOURCES UTILISÉES (toutes publiques, sans clé, CORS activé) :
+     - geo.api.gouv.fr ......................... commune, population, densité
+     - data.geopf.fr (Géocodage + WMTS) ........ recherche d'adresse, fonds de carte
+     - nominatim.openstreetmap.org ............. géocodage de secours
+     - overpass-api.de (+2 miroirs) ............ équipements OSM (POI)
+     - air-quality-api.open-meteo.com .......... qualité de l'air (CAMS) + pollens
+     - api.open-meteo.com ...................... UV, ensoleillement, altitude, climat
+     - hubeau.eaufrance.fr ..................... qualité de l'eau potable (Hub'Eau)
+     - georisques.gouv.fr ...................... risques naturels/technologiques, ICPE, CatNat
+     - apidf-preprod.cerema.fr (DVF) ........... prix immobilier €/m²
+     - apicarto.ign.fr ........................ zonage PLU + zones naturelles protégées
+
+   LIMITES CONNUES :
+     - ATMO France, transport.data.gouv.fr et l'API INSEE exigent un jeton
+       même si leurs données sont open : non intégrées ici.
+     - Géorisques et apicarto bloquent parfois les pages ouvertes en file://
+       (CORS) : servir la page en HTTP(S) local.
+     - Overpass peut être lent : 3 miroirs + 6 tentatives sont prévus.
+
+   MAINTENANCE EXPRESS :
+     - Ajouter un équipement  → nouvelle ligne dans I[] (champ q = clé/valeurs OSM).
+     - Changer les poids      → champ w de chaque ligne de I[].
+     - Ajuster un profil      → objet PROF.
+     - Ajouter un thème        → clé dans TH (couleur) + t:'...' dans les indicateurs.
+     - Ajouter une API        → fonction async dans §SOURCES, alimentée dans load().
+   ====================================================================== */
+
+/* ======================================================================
+   1) CONFIGURATION
+   ====================================================================== */
+/* TH : couleurs par thème (clé = libellé affiché, valeur = couleur POI). */
+const TH={Services:'#2563eb',Santé:'#dc2626',Mobilité:'#7c3aed',Environnement:'#16a34a',Risques:'#ea580c',Commerces:'#0891b2',Loisirs:'#db2777'};
+/* GRP : numéro de requête Overpass par thème (1=services+santé, 2=mobilité,
+   3=environnement+commerces+loisirs). Regrouper des thèmes = moins de requêtes. */
+const GRP={Services:1,Santé:1,Mobilité:2,Environnement:3,Commerces:3,Loisirs:3};
+
+/* I : les indicateurs du score.
+   Champs d'une ligne :
+     id  : identifiant interne (servira de clé dans PROF)
+     l   : libellé affiché
+     t   : thème (clé de TH)
+     w   : poids de base en %
+     q   : [[clé OSM, valeurs...]] (absent si indicateur API/bruit)
+     r   : rayon de recherche en mètres
+     i   : distance idéale (score 100 % de proximité en dessous)
+     m   : distance max (score de proximité 0 au-delà)
+     s   : saturation : nb d'équipements pour ~63 % du score de densité
+     api:1 → valeur calculée par une API ; noise:1 → calcul du calme via OSM. */
+const I=[
+{id:'ecole',l:'Écoles et collèges',t:'Services',w:7,r:2500,i:400,m:2500,s:4,q:[['amenity','school'],['amenity','college']]},
+{id:'creche',l:'Crèches et maternelles',t:'Services',w:4,r:2000,i:500,m:2000,s:2,q:[['amenity','kindergarten','childcare']]},
+{id:'banque',l:'Banques et distributeurs',t:'Services',w:3,r:3000,i:600,m:3000,s:3,q:[['amenity','bank','atm']]},
+{id:'poste',l:'Bureaux de poste',t:'Services',w:2,r:3000,i:800,m:3000,s:1,q:[['amenity','post_office']]},
+{id:'public',l:'Mairie, police, pompiers',t:'Services',w:4,r:4000,i:800,m:4000,s:2,q:[['amenity','townhall','police','fire_station']]},
+{id:'decheterie',l:'Déchèteries et recyclage',t:'Services',w:2,r:3000,i:700,m:3000,s:1,q:[['amenity','recycling','waste_transfer_station']]},
+{id:'pharmacie',l:'Pharmacies',t:'Santé',w:6,r:2000,i:400,m:2500,s:2,q:[['amenity','pharmacy']]},
+{id:'medecin',l:'Médecins et cliniques',t:'Santé',w:6,r:2500,i:500,m:3000,s:3,q:[['amenity','doctors','clinic']]},
+{id:'hopital',l:'Hôpitaux et urgences',t:'Santé',w:5,r:15000,i:2000,m:15000,s:1,q:[['amenity','hospital']]},
+{id:'dentiste',l:'Dentistes',t:'Santé',w:3,r:3000,i:600,m:3000,s:2,q:[['amenity','dentist']]},
+{id:'arret',l:'Arrêts de bus, tram, métro',t:'Mobilité',w:7,r:1500,i:300,m:1500,s:5,q:[['highway','bus_stop'],['railway','tram_stop','station','halt','subway_entrance']]},
+{id:'gare',l:'Gares (train)',t:'Mobilité',w:3,r:10000,i:1500,m:10000,s:1,q:[['railway','station','halt']]},
+{id:'velo',l:'Pistes cyclables et vélos partagés',t:'Mobilité',w:3,r:2000,i:300,m:2000,s:6,q:[['highway','cycleway'],['amenity','bicycle_rental']]},
+{id:'irve',l:'Bornes de recharge électrique',t:'Mobilité',w:2,r:3000,i:500,m:3000,s:2,q:[['amenity','charging_station']]},
+{id:'air',l:'Qualité de l’air (IQEA)',t:'Environnement',w:5,api:1},
+{id:'eau',l:'Qualité de l’eau potable',t:'Environnement',w:2,api:1},
+{id:'pollens',l:'Pollens',t:'Environnement',w:2,api:1},
+{id:'uv',l:'Index UV / ensoleillement',t:'Environnement',w:2,api:1},
+{id:'vert',l:'Espaces verts',t:'Environnement',w:4,r:2000,i:300,m:2000,s:4,q:[['leisure','park','garden','nature_reserve'],['landuse','forest'],['natural','wood']]},
+{id:'calme',l:'Calme (voies rapides, ferrées)',t:'Environnement',w:3,noise:1},
+{id:'rnat',l:'Risques naturels',t:'Risques',w:6,api:1},
+{id:'rtec',l:'Risques technologiques',t:'Risques',w:4,api:1},
+{id:'super',l:'Supermarchés',t:'Commerces',w:4,r:3000,i:500,m:3000,s:2,q:[['shop','supermarket']]},
+{id:'station',l:'Stations-service',t:'Commerces',w:2,r:3000,i:800,m:3000,s:2,q:[['amenity','fuel']]},
+{id:'boul',l:'Boulangeries',t:'Commerces',w:3,r:2000,i:400,m:2000,s:2,q:[['shop','bakery']]},
+{id:'prox',l:'Commerces de proximité et marchés',t:'Commerces',w:3,r:2000,i:400,m:2000,s:4,q:[['shop','convenience','butcher','greengrocer','deli','cheese','fishmonger'],['amenity','marketplace']]},
+{id:'sport',l:'Équipements sportifs',t:'Loisirs',w:2,r:2500,i:500,m:2500,s:3,q:[['leisure','pitch','sports_centre','swimming_pool','fitness_centre']]},
+{id:'culture',l:'Culture (cinéma, médiathèque, musée)',t:'Loisirs',w:1,r:3000,i:800,m:3000,s:2,q:[['amenity','library','cinema','theatre','arts_centre'],['tourism','museum']]},
+{id:'resto',l:'Cafés et restaurants',t:'Loisirs',w:1,r:1500,i:300,m:1500,s:5,q:[['amenity','restaurant','cafe','bar']]},
+{id:'jeux',l:'Aires de jeux',t:'Loisirs',w:1,r:1500,i:300,m:1500,s:2,q:[['leisure','playground']]}
+];
+
+/* PROF : multiplicateurs de poids par profil et par id d'indicateur.
+   Équilibré = neutre (tous les multiplicateurs à 1 implicitement). */
+const PROF={'Équilibré':{},Famille:{ecole:2,creche:2,vert:1.5,jeux:3,pharmacie:1.3,medecin:1.3,calme:1.5,resto:.5},
+Senior:{pharmacie:1.8,medecin:1.8,hopital:1.8,arret:1.6,calme:1.8,vert:1.3,velo:.4,ecole:.3,creche:.2,jeux:.2},
+Étudiant:{arret:1.8,velo:2,resto:2.5,culture:2.5,super:1.3,pharmacie:.7,medecin:.6,hopital:.5,ecole:.2,creche:.1,jeux:.2}};
+
+/* Miroirs Overpass : rotation automatique en cas d'échec ou de timeout. */
+const OVP=['https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+
+/* Fonds de carte IGN (Géoplateforme, WMTS, sans clé) + OSM. */
+const IGN=(l,f)=>`https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&LAYER=${l}&FORMAT=${f}&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}`;
+const att='© IGN Géoplateforme';
+const BASES={'Plan IGN':L.tileLayer(IGN('GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2','image/png'),{maxZoom:18,attribution:att}),
+'Photo aérienne IGN':L.tileLayer(IGN('ORTHOIMAGERY.ORTHOPHOTOS','image/jpeg'),{maxZoom:19,attribution:att}),
+'OpenStreetMap':L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© contributeurs OpenStreetMap'})};
+/* Calques optionnels (sélecteur de Leaflet, en surimpression). */
+const OVERS={'Cadastre':L.tileLayer(IGN('CADASTRALPARCELS.PARCELLAIRE_EXPRESS','image/png'),{maxZoom:19,opacity:.8,attribution:att}),
+'Pentes (relief)':L.tileLayer(IGN('ELEVATION.SLOPES','image/png'),{maxZoom:18,opacity:.55,attribution:att})};
+
+/* ======================================================================
+   2) UTILITAIRES
+   ====================================================================== */
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); /* anti-XSS pour tout contenu injecté */
+const cls=s=>s>=80?'g':s>=50?'o':'r';            /* classe CSS selon le score */
+const col=s=>s>=80?'#1a9d5b':s>=50?'#d99a00':'#d23f31'; /* couleur selon le score */
+const clamp=(x,a=0,b=100)=>Math.max(a,Math.min(b,x));
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+/* Distance approx. (mètres) entre deux points lat/lon — précision suffisante <20 km. */
+function dist(a,b,c,d){const p=Math.PI/180,x=(c-a)*p,y=(d-b)*p*Math.cos((a+c)/2*p);return Math.sqrt(x*x+y*y)*6371000}
+/* Distance (mètres) d'un point à une polyligne [{lat,lon}...] — pour le bruit. */
+function dPoly(lat,lon,g){const k=Math.cos(lat*Math.PI/180),R=111320;let m=1e9;
+for(let i=0;i<g.length-1;i++){const ax=(g[i].lon-lon)*k*R,ay=(g[i].lat-lat)*R,bx=(g[i+1].lon-lon)*k*R,by=(g[i+1].lat-lat)*R,dx=bx-ax,dy=by-ay,l=dx*dx+dy*dy,t=l?clamp(-(ax*dx+ay*dy)/l,0,1):0;m=Math.min(m,Math.hypot(ax+t*dx,ay+t*dy))}
+return m}
+
+/* État global :
+   ctl/rid  : abort des requêtes en cours + id de la dernière recherche
+   flt      : filtre de thème actif ('Tous' par défaut)
+   last     : dernier lieu calculé {S,D,lat,lon,name,label}
+   cache    : Map clé "lat,lon" → données brutes (évite de recharger un lieu)
+   hist     : Map des lieux évalués, persistée en localStorage (comparateur) */
+let ctl=null,rid=0,flt='Tous',last=null;const cache=new Map(),hist=new Map();
+try{JSON.parse(localStorage.getItem('kalitevi-hist')||'[]').forEach(h=>hist.set(h.k,h))}catch(e){}
+
+/* J : fetch JSON avec timeout (ms) et annulation si une nouvelle recherche démarre. */
+async function J(u,o={},ms=25000){
+const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
+if(ctl)ctl.signal.addEventListener('abort',()=>c.abort());
+try{const r=await fetch(u,{...o,signal:c.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}finally{clearTimeout(t)}
+}
+const safe=p=>p.catch(()=>null);        /* une source en échec ne bloque jamais les autres */
+const med=a=>{a=a.slice().sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:null}; /* médiane */
+
+/* ======================================================================
+   3) CARTE
+   ====================================================================== */
+const map=L.map('map',{layers:[BASES['Plan IGN']]}).setView([46.6,2.4],6);
+L.control.layers(BASES,OVERS,{collapsed:true}).addTo(map);
+let marker=null;                          /* pin principal (score du lieu courant) */
+const poiLayer=L.layerGroup().addTo(map); /* POI des indicateurs (filtre par thème) */
+const histLayer=L.layerGroup().addTo(map);/* lieux de l'historique (petits ronds) */
+/* pin(score) : icône divIcon colorée selon le score ; null = en cours de calcul. */
+const pin=s=>L.divIcon({className:'',iconSize:[34,34],iconAnchor:[17,34],html:`<div class="pin" style="background:${s==null?'#64748b':col(s)}"><b>${s==null?'…':s}</b></div>`});
+/* drawHist : redessine les lieux mémorisés (clic = recharger ce lieu). */
+function drawHist(){histLayer.clearLayers();hist.forEach(h=>{if(last&&h.k===last.S.key)return;L.circleMarker([h.lat,h.lon],{radius:6,color:'#fff',weight:2,fillColor:col(h.total),fillOpacity:.85}).bindTooltip(`${esc(h.name)} : ${h.total}/100`).on('click',()=>load(h.lat,h.lon,h.name)).addTo(histLayer)})}
+
+/* ======================================================================
+   4) SOURCES DE DONNÉES (une fonction par API)
+   ====================================================================== */
+
+/* --- Commune : nom, code INSEE, population, surface, EPCI, région --- */
+const commune=async(lat,lon)=>{const d=await J(`https://geo.api.gouv.fr/communes?lat=${lat}&lon=${lon}&fields=nom,code,population,surface,codesPostaux,departement,region,epci&format=json`);return d&&d[0]||null};
+
+/* --- Overpass : essaye chaque miroir (6 tentatives au total, pause croissante). --- */
+async function ovp(body){
+for(let a=0;a<6;a++){
+try{const d=await J(OVP[a%OVP.length]+'?data='+encodeURIComponent(body),{},40000);
+if(d&&d.elements&&!(d.remark&&/timed out|out of memory/i.test(d.remark)&&!d.elements.length))return d.elements}
+catch(e){if(ctl.signal.aborted)throw e}
+await sleep(900+a*900);
+}
+return null;
+}
+/* osmGroups : 4 requêtes en parallèle — une par GRP (équipements), une pour le bruit. */
+function osmGroups(lat,lon){
+const mk=g=>{const it=I.filter(x=>x.q&&GRP[x.t]===g);return ovp(`[out:json][timeout:30];(${it.map(x=>x.q.map(([k,...v])=>`nwr["${k}"~"^(${v.join('|')})$"](around:${x.r},${lat},${lon});`).join('')).join('')});out center tags;`)};
+const noise=ovp(`[out:json][timeout:30];(way["highway"~"^(motorway|trunk|primary)$"](around:500,${lat},${lon});way["railway"="rail"](around:500,${lat},${lon}););out geom tags;`);
+return Promise.all([mk(1),mk(2),mk(3),noise].map(safe));
+}
+
+/* --- Qualité de l'air : IQEA européen (Open-Meteo, modèle CAMS). Score = 100 - 0.9*IQEA. --- */
+async function air(lat,lon){
+const d=await J(`https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=european_aqi,pm2_5,pm10,nitrogen_dioxide,ozone`);
+const c=d&&d.current;if(!c||c.european_aqi==null)return null;
+return{score:Math.round(clamp(100-c.european_aqi*.9)),info:`IQEA ${c.european_aqi}, PM2,5 ${c.pm2_5} µg/m³, NO₂ ${c.nitrogen_dioxide} µg/m³`};
+}
+/* --- Pollens : concentration max sur 5 taxons (grains/m³). Score = 100 - 10*max. --- */
+async function pollens(lat,lon){
+const d=await J(`https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=alder_pollen,birch_pollen,grass_pollen,mugwort_pollen,ragweed_pollen&timezone=auto`);
+const c=d&&d.current;if(!c)return null;
+const keys=Object.keys(c).filter(k=>k.endsWith('_pollen')&&c[k]!=null);
+if(!keys.length)return null;
+const max=Math.max(...keys.map(k=>c[k])),names={alder:'aulne',birch:'bouleau',grass:'graminées',mugwort:'armoise',ragweed:'ambroisie'};
+const worst=keys.filter(k=>c[k]===max).map(k=>names[k.replace('_pollen','')]).join(', ');
+return{score:Math.round(clamp(100-max*10)),info:max===0?'aucun pollen détecté':`max ${max} grains/m³ (${worst})`};
+}
+/* --- Index UV du jour + ensoleillement (Open-Meteo). Pénalité au-delà de UV 6. --- */
+async function uv(lat,lon){
+const d=await J(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=uv_index_max,sunshine_duration&forecast_days=1&timezone=auto`);
+const q=d&&d.daily;if(!q||q.uv_index_max==null)return null;
+const uvv=q.uv_index_max[0];
+return{score:Math.round(clamp(100-Math.max(0,uvv-6)*12)),info:`index UV max ${uvv} aujourd'hui, ${Math.round((q.sunshine_duration||[0])[0]/3600)} h d'ensoleillement`};
+}
+/* --- Eau potable : % d'analyses conformes (Hub'Eau, code INSEE requis). --- */
+async function eau(code){
+if(!code)return null;
+const d=await J(`https://hubeau.eaufrance.fr/api/v1/qualite_eau_potable/resultats_dis?code_commune=${code}&size=200&fields=date_prelevement,conformite_limites_bact_prelevement,conformite_limites_pc_prelevement`);
+let ok=0,n=0;((d&&d.data)||[]).forEach(r=>[r.conformite_limites_bact_prelevement,r.conformite_limites_pc_prelevement].forEach(v=>{if(v==='C'){ok++;n++}else if(v==='N')n++}));
+return n?{score:Math.round(100*ok/n),info:`${Math.round(100*ok/n)} % des analyses conformes (${n} paramètres)`}:null;
+}
+/* --- Risques : rapport Géorisques + ICPE (3 km) + arrêtés CatNat (code INSEE). --- */
+async function risques(lat,lon,code){
+const G='https://georisques.gouv.fr/api/v1/';
+const[rr,ic,cn]=await Promise.all([safe(J(`${G}resultats_rapport_risque?latlon=${lon},${lat}`)),safe(J(`${G}installations_classees?latlon=${lon},${lat}&rayon=3000&page_size=100`)),code?safe(J(`${G}gaspar/catnat?code_insee=${code}&page_size=200`)):null]);
+if(!rr&&!ic&&!cn)return null;
+const pr=o=>Object.entries(o||{}).filter(([k,v])=>v&&v.present===true).map(([k,v])=>v.libelle||k);
+const nIc=ic?(ic.data||ic.results||[]).length:null,nCn=cn?(cn.data||cn.results||[]).length:null;
+const nat=pr(rr&&rr.risquesNaturels),tec=pr(rr&&rr.risquesTechnologiques);
+return{nat:rr||cn?{score:Math.round(clamp(100-nat.length*12-Math.min(25,(nCn||0)*1.5))),info:[nat.length?nat.join(', '):'aucun risque recensé',nCn!=null?nCn+' arrêté(s) de catastrophe naturelle':''].filter(Boolean).join(' ; ')}:null,
+tec:rr||ic?{score:Math.round(clamp(100-tec.length*20-Math.min(40,(nIc||0)*4))),info:[tec.length?tec.join(', '):'aucun risque recensé',nIc!=null?nIc+' site(s) industriel(s) classé(s) à moins de 3 km':''].filter(Boolean).join(' ; ')}:null};
+}
+/* --- Altitude ponctuelle (Open-Meteo elevation). --- */
+const altitude=async(lat,lon)=>{const d=await J(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`);return d&&d.elevation?Math.round(d.elevation[0]):null};
+/* --- Climat de l'année écoulée (archive Open-Meteo) : affiché hors score. --- */
+async function climat(lat,lon){
+const y=new Date().getFullYear()-1;
+const d=await J(`https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${y}-01-01&end_date=${y}-12-31&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,sunshine_duration&timezone=auto`);
+const q=d&&d.daily;if(!q||!q.time)return null;
+const n=q.time.length,sum=a=>a.reduce((s,v)=>s+(v||0),0);
+return`${y} : ${(sum(q.temperature_2m_max.map((v,i)=>(v+q.temperature_2m_min[i])/2))/n).toFixed(1)} °C en moyenne, ${q.temperature_2m_max.filter(v=>v>=30).length} jours ≥ 30 °C, ${q.temperature_2m_min.filter(v=>v<=0).length} jours de gel, ${Math.round(sum(q.precipitation_sum))} mm, ${Math.round(sum(q.sunshine_duration)/3600)} h de soleil`;
+}
+/* --- Prix immobilier : ventes DVF (Cerema) dans un carré ~650 m, €/m² médian. --- */
+async function dvf(lat,lon){
+const dy=.006,dx=dy/Math.cos(lat*Math.PI/180);
+const d=await J(`https://apidf-preprod.cerema.fr/dvf_opendata/geomutations/?in_bbox=${lon-dx},${lat-dy},${lon+dx},${lat+dy}&anneemut_min=2022&page_size=500`);
+const f=(d&&(d.features||(d.results&&d.results.features)))||[];
+const p=f.map(x=>{const q=x.properties||{},v=parseFloat(q.valeurfonc),s=(parseFloat(q.sbatapt)||0)+(parseFloat(q.sbatmai)||0);return s>9?v/s:null}).filter(v=>v&&v>300&&v<30000);
+return p.length>=3?`${Math.round(med(p)).toLocaleString('fr-FR')} €/m² médian (${p.length} ventes depuis 2022, rayon 650 m)`:null;
+}
+/* --- Zonage PLU/POS au point cliqué (API Carto IGN, GPU). --- */
+async function urbanisme(lat,lon){
+const g=encodeURIComponent(JSON.stringify({type:'Point',coordinates:[lon,lat]}));
+const d=await J(`https://apicarto.ign.fr/api/gpu/zone-urba?geom=${g}`,{},12000);
+const p=d&&d.features&&d.features[0]&&d.features[0].properties;
+return p?`${p.libelle||''} (${({U:'zone urbaine',AU:'à urbaniser',A:'agricole',N:'naturelle'})[p.typezone]||p.typezone})`:d?'hors zone de PLU numérisé':null;
+}
+/* --- Zones naturelles protégées au point (API Carto IGN, 6 jeux). --- */
+async function nature(lat,lon){
+const g=encodeURIComponent(JSON.stringify({type:'Point',coordinates:[lon,lat]}));
+const T=[['znieff1','ZNIEFF type 1'],['znieff2','ZNIEFF type 2'],['natura-habitat','Natura 2000 habitats'],['natura-oiseaux','Natura 2000 oiseaux'],['pnr','Parc naturel régional'],['pn','Parc national']];
+const r=await Promise.all(T.map(([e,n])=>safe(J(`https://apicarto.ign.fr/api/nature/${e}?geom=${g}`,{},12000)).then(d=>d?((d.features||[]).length?n:''):null)));
+return r.every(x=>x===null)?null:(r.filter(Boolean).join(', ')||'aucune zone protégée à cet endroit');
+}
+
+/* ======================================================================
+   5) CALCUL DU SCORE
+   ====================================================================== */
+/* scoreInd : score d'un indicateur OSM = 70 % proximité du plus proche
+   (1 sous x.i, décroit linéairement jusqu'à 0 à x.m)
+   + 30 % densité (1-exp(-n/s), n = nombre trouvés, s = saturation). */
+function scoreInd(x,items){
+if(!items.length)return 0;
+const d=Math.min(...items.map(i=>i.d)),prox=d<=x.i?1:Math.max(0,1-(d-x.i)/(x.m-x.i)),dens=1-Math.exp(-items.length/x.s);
+return Math.round(100*(.7*prox+.3*dens));
+}
+/* calme : pénalités cumulées selon la distance de la voie rapide / ferrée / principale. */
+function calme(lat,lon,els){
+const best={};
+els.forEach(e=>{if(!e.geometry)return;const t=e.tags||{},k=t.railway?'rail':/motorway|trunk/.test(t.highway)?'fast':'prim',d=dPoly(lat,lon,e.geometry);if(!(k in best)||d<best[k])best[k]=d});
+const T={fast:[[100,60],[250,35],[500,15]],rail:[[100,40],[250,25],[500,10]],prim:[[50,20],[150,10]]},N={fast:'voie rapide',rail:'voie ferrée',prim:'route principale'};
+let p=0;const inf=[];
+Object.keys(best).forEach(k=>{const r=T[k].find(([m])=>best[k]<=m);if(r){p+=r[1];inf.push(`${N[k]} à ${Math.round(best[k])} m`)}});
+return{score:Math.round(clamp(100-p)),info:inf.length?inf.join(', '):'aucune source de bruit majeure à moins de 500 m'};
+}
+/* compute : agrège tous les indicateurs.
+   Sortie : res (par indicateur : score, poids, poids renormalisé ew, contribution),
+   pois (10 plus proches POI par indicateur), themes (moyenne pondérée par thème),
+   total (moyenne pondérée), conf (part du poids réellement mesurée, -20 % si
+   les données OSM sont très clairsemées), sparse. */
+function compute(lat,lon,D,prof){
+const res=[],pois=[],P=PROF[prof]||{};
+I.forEach(x=>{
+const r={x,score:null,info:'',w:x.w*(P[x.id]||1)};
+if(x.api){ /* indicateurs API : air, eau, pollens, uv, risques */
+const v=x.id==='air'?D.air:x.id==='eau'?D.eau:x.id==='pollens'?D.pol:x.id==='uv'?D.uv:D.risq&&(x.id==='rnat'?D.risq.nat:D.risq.tec);if(v){r.score=v.score;r.info=v.info}}
+else if(x.noise){const e=D.els[3];if(e){const v=calme(lat,lon,e);r.score=v.score;r.info=v.info}}
+else{ /* indicateurs OSM : filtrage des éléments par clé/valeur + distance */
+const els=D.els[GRP[x.t]-1];
+if(els){
+const items=[];
+els.forEach(e=>{const t=e.tags||{};if(!x.q.some(([k,...v])=>v.includes(t[k])))return;const la=e.lat??e.center?.lat,lo=e.lon??e.center?.lon;if(la==null)return;const d=dist(lat,lon,la,lo);if(d<=x.r)items.push({d,la,lo,name:t.name||x.l})});
+r.score=scoreInd(x,items);
+r.info=items.length?`${items.length} trouvé(s), le plus proche à ${Math.round(Math.min(...items.map(i=>i.d)))} m`:`aucun dans ${x.r>=1000?x.r/1000+' km':x.r+' m'}`;
+items.sort((a,b)=>a.d-b.d).slice(0,10).forEach(i=>pois.push({...i,theme:x.t,ind:x.l}));
+}}
+res.push(r);
+});
+/* Renormalisation : les indicateurs sans donnée sont exclus du total. */
+const av=res.filter(r=>r.score!=null),W=av.reduce((s,r)=>s+r.w,0),WT=res.reduce((s,r)=>s+r.w,0);
+res.forEach(r=>{r.ew=r.score==null?0:r.w/W*100;r.contrib=r.score==null?0:r.score*r.ew/100});
+const themes={};
+Object.keys(TH).forEach(t=>{const a=av.filter(r=>r.x.t===t),w=a.reduce((s,r)=>s+r.w,0);themes[t]=w?Math.round(a.reduce((s,r)=>s+r.score*r.w,0)/w):null});
+const sparse=D.els.slice(0,3).every(e=>e&&e.length)&&D.els.slice(0,3).reduce((s,e)=>s+e.length,0)<12;
+return{key:lat.toFixed(4)+','+lon.toFixed(4),res,pois,themes,total:W?Math.round(av.reduce((s,r)=>s+r.score*r.w,0)/W):null,conf:Math.round(W/WT*100*(sparse?.8:1)),sparse};
+}
+
+/* ======================================================================
+   6) RENDU DU PANNEAU
+   ====================================================================== */
+/* saveHist : mémorise le lieu (max 8) pour le comparateur + localStorage. */
+function saveHist(name,S,lat,lon){
+hist.set(S.key,{k:S.key,name,total:S.total,themes:S.themes,lat,lon});
+if(hist.size>8){const first=hist.keys().next().value;hist.delete(first)}
+localStorage.setItem('kalitevi-hist',JSON.stringify([...hist.values()]));
+drawHist();
+}
+/* renderCmp : tableau comparatif des lieux évalués. */
+function renderCmp(){
+if(!hist.size)return '';
+return `<div class="sec"><h3>Lieux comparés (historique)</h3><table><tr><th>Lieu</th><th>Score</th>${Object.keys(TH).map(t=>`<th>${t.slice(0,4)}.</th>`).join('')}</tr>
+${[...hist.values()].reverse().map(h=>`<tr ${last&&h.k===last.S.key?'style="font-weight:700"':''}><td><a href="#${h.k}" style="color:var(--acc)">${esc(h.name)}</a></td><td class="${cls(h.total)} cmp-score">${h.total}</td>${Object.keys(TH).map(t=>`<td>${h.themes[t]??'–'}</td>`).join('')}</tr>`).join('')}
+<tr><td colspan="9"><button id="bClear">Vider l’historique</button></td></tr></table></div>`;
+}
+/* render : reconstruit tout le panneau latéral à partir de `last`. */
+function render(){
+if(!last)return;
+const{S,name,D,lat,lon}=last,sc=S.total,okAll=D.status.every(s=>s.ok);
+/* --- Bloc résumé : score global + confiance + avertissements --- */
+$('summary').innerHTML=`<h2 style="margin:0 0 8px;font-size:17px">KALITEVI – ${esc(name)}</h2>
+<div class="hero"><div class="big ${sc==null?'':cls(sc)}">${sc==null?'--':sc}<small>/100</small></div>
+<div style="flex:1"><div class="mut">Indice de confiance : ${S.conf} %</div><div class="conf"><i style="width:${S.conf}%"></i></div>
+<div class="mut">${sc==null?'':sc>=80?'Excellent':sc>=50?'Moyen':'Faible'} · profil ${esc($('prof').value)}</div></div></div>
+${okAll?'':'<div class="msg">Certaines sources n’ont pas répondu (voir « Sources »). Le score est calculé sur le reste. <button id="retry">Relancer</button></div>'}
+${S.sparse?'<div class="msg">Peu de données OpenStreetMap ici : score à prendre avec prudence.</div>':''}`;
+const rb=$('retry');if(rb)rb.onclick=()=>load(lat,lon,last.label);
+const cb=$('bClear');if(cb)cb.onclick=()=>{hist.clear();localStorage.removeItem('kalitevi-hist');drawHist();render()};
+/* --- Détails : filtres, thèmes, contributions, contexte, historique, sources, méthode --- */
+const chips=['Tous',...Object.keys(TH)].map(t=>`<span class="chip ${t===flt?'on':''}" role="button" tabindex="0" data-t="${t}">${t}</span>`).join('');
+const vis=S.res.filter(r=>flt==='Tous'||r.x.t===flt);
+const rows=vis.map(r=>r.score==null?`<tr class="na"><td>${esc(r.x.l)}</td><td>n/d</td><td>–</td><td>–</td></tr>`
+:`<tr><td>${esc(r.x.l)}<div class="mut">${esc(r.info)}</div></td><td class="${cls(r.score)}"><b>${r.score}</b></td><td>${r.ew.toFixed(1)} %</td><td>${r.contrib.toFixed(1)}</td></tr>`).join('');
+const c=D.com,E=D.extra,kv=(a,b)=>b==null||b===''?'':`<div class="kv"><span>${a}</span><span>${esc(b)}</span></div>`;
+$('detail').innerHTML=`<div class="chips">${chips}</div>
+<div class="sec"><h3>Scores par thème</h3>${Object.keys(TH).map(t=>`<div class="th"><span>${t}</span><div class="bar"><i style="width:${S.themes[t]||0}%;background:${S.themes[t]==null?'#cbd5d3':col(S.themes[t])}"></i></div><b>${S.themes[t]??'–'}</b></div>`).join('')}
+<p class="mut" style="margin:6px 0 0">Cliquez sur un thème pour filtrer les POI correspondants sur la carte.</p></div>
+<div class="sec"><h3>Contribution de chaque indicateur</h3><table><tr><th>Indicateur</th><th>Score</th><th>Poids</th><th>Contrib.</th></tr>${rows}
+<tr><td><b>Total</b></td><td></td><td></td><td><b>${vis.reduce((s,r)=>s+r.contrib,0).toFixed(1)}</b></td></tr></table></div>
+<div class="sec"><h3>Contexte du lieu (hors score)</h3>
+${kv('Commune',c?`${c.nom} (${c.departement?c.departement.code:''})`:'inconnue')}
+${kv('Territoire',c&&[c.epci&&c.epci.nom,c.region&&c.region.nom].filter(Boolean).join(', '))}
+${kv('Population',c&&c.population&&c.population.toLocaleString('fr-FR')+' hab.'+(c.surface?`, ${Math.round(c.population/(c.surface/100)).toLocaleString('fr-FR')} hab./km²`:''))}
+${kv('Altitude',E.alt!=null?E.alt+' m':null)}
+${kv('Prix de l’immobilier',E.dvf)}
+${kv('Zonage d’urbanisme',E.plu)}
+${kv('Espaces naturels protégés',E.nat)}
+${kv('Coordonnées',lat.toFixed(4)+', '+lon.toFixed(4))}
+${E.clim?`<p class="mut" style="margin:6px 0 0">Climat ${esc(E.clim)}</p>`:''}</div>
+${renderCmp()}
+<div class="sec"><h3>Sources</h3>${D.status.map(s=>`<div class="kv"><span>${esc(s.name)}</span><span class="${s.ok?'ok':'ko'}">${s.ok?'✓ reçu':'✗ indisponible'}</span></div>`).join('')}
+<p class="mut">APIs 100 % ouvertes, sans clé : Géoportail/IGN, geo.api.gouv, Hub’Eau, Géorisques, Overpass/OSM, Open-Meteo, DVF (Cerema), Nominatim. Géorisques ou le cadastre peuvent être bloqués en <code>file://</code> : préférez un serveur local ou HTTPS.</p></div>
+<details class="sec"><summary><b>Méthode</b></summary>
+<p class="mut">Équipements OSM : 70 % distance au plus proche, 30 % nombre (rendement décroissant). Air, pollens, UV, eau, risques et calme viennent de mesures ou bases officielles. Indicateurs sans donnée exclus et poids renormalisés ; l’indice de confiance est la part du poids réellement mesurée.</p>
+<p class="mut">Poids de base ≈ Services 22, Santé 20, Mobilité 15, Environnement 18, Risques 10, Commerces 12, Loisirs 5. Les profils les modulent. Ce sont des choix de conception, pas des valeurs scientifiques.</p></details>`;
+/* --- POI sur la carte, filtrés par thème actif --- */
+poiLayer.clearLayers();
+S.pois.filter(p=>flt==='Tous'||p.theme===flt).forEach(p=>L.circleMarker([p.la,p.lo],{radius:5,color:'#fff',weight:1,fillColor:TH[p.theme],fillOpacity:.9}).bindTooltip(`${esc(p.name)} · ${esc(p.ind)} · ${Math.round(p.d)} m`).addTo(poiLayer));
+}
+/* Filtres de thème : clic + clavier (accessibilité). */
+$('detail').addEventListener('click',e=>{const c=e.target.closest('.chip');if(c){flt=c.dataset.t;render()}});
+$('detail').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){const c=e.target.closest('.chip');if(c){e.preventDefault();flt=c.dataset.t;render()}}});
+/* Changement de profil : recalcul immédiat (pas de nouvel appel réseau). */
+$('prof').onchange=()=>{if(!last)return;last.S=compute(last.lat,last.lon,last.D,$('prof').value);marker.setIcon(pin(last.S.total));saveHist(last.name,last.S,last.lat,last.lon);render()};
+/* Export CSV (séparateur ';', BOM UTF-8 pour Excel) des indicateurs du lieu courant. */
+$('bCsv').onclick=()=>{
+if(!last)return;
+const {S,name,D}=last;
+const q=s=>String(s??'').replace(/"/g,'""');
+const lines=['Indicateur;Theme;Score;Poids %;Contribution;Detail'];
+S.res.forEach(r=>lines.push([q(r.x.l),q(r.x.t),r.score??'',r.ew?r.ew.toFixed(1):'',r.contrib.toFixed(1),q(r.info)].join(';')));
+lines.push(['TOTAL','',S.total??'',100,S.res.reduce((s,r)=>s+r.contrib,0).toFixed(1),'']);
+lines.push(['Confiance %','','',S.conf,'','']);
+Object.keys(S.themes).forEach(t=>lines.push([q('Thème '+t),'',S.themes[t]??'','','','']));
+const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv'});
+const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='kalitevi_'+name.replace(/[^\w-]+/g,'_')+'.csv';a.click();URL.revokeObjectURL(a.href);
+};
+
+/* ======================================================================
+   7) CHARGEMENT D'UN LIEU (orchestration)
+   ====================================================================== */
+/* load(lat,lon,label) : interrompt les requêtes précédentes, lance toutes les
+   sources en parallèle, affiche leur avancement (setStatus), puis calcule
+   et rend le score. Les données brutes sont mises en cache par coordonnées. */
+async function load(lat,lon,label){
+if(ctl)ctl.abort();ctl=new AbortController();const id=++rid,key=lat.toFixed(4)+','+lon.toFixed(4);
+if(marker)map.removeLayer(marker);
+marker=L.marker([lat,lon],{icon:pin(null)}).addTo(map);
+map.setView([lat,lon],Math.max(map.getZoom(),14));
+$('summary').innerHTML='<p class="mut">Calcul en cours…</p>';
+$('detail').innerHTML='';poiLayer.clearLayers();
+/* Ordre = ordre des sources dans le tableau `status` (l'affichage §Chargement). */
+const names=['Équipements OSM : services et santé','Équipements OSM : mobilité','Équipements OSM : commerces, loisirs, nature','Voies bruyantes (OSM)','Commune (geo.api.gouv.fr)','Qualité de l’air (Open-Meteo/CAMS)','Pollens (Open-Meteo)','Index UV (Open-Meteo)','Eau potable (Hub’Eau)','Risques (Géorisques)','Altitude (Open-Meteo)','Climat (Open-Meteo)','Prix immobilier (DVF Cerema)','Urbanisme (Géoportail de l’urbanisme)','Zones naturelles protégées (API Carto IGN)'];
+const status=names.map(n=>({name:n,ok:null}));
+/* setStatus : met à jour la liste des sources (… en cours, ✓ reçu, ✗ indisponible). */
+const setStatus=(i,ok)=>{status[i].ok=ok;if(id===rid){$('detail').innerHTML=`<div class="sec"><h3>Chargement des sources…</h3><div id="loadlist">${status.map(s=>`<div class="${s.ok==null?'wait':s.ok?'ok':'ko'}">${s.ok==null?'…':s.ok?'✓':'✗'} ${esc(s.name)}</div>`).join('')}</div></div>${renderCmp()}`}};
+try{
+let D=cache.get(key);
+if(!D){
+const comP=safe(commune(lat,lon)).then(v=>{setStatus(4,v!=null);return v});
+const run=(i,f)=>safe(Promise.resolve(f())).then(v=>{setStatus(i,v!=null);return v});
+const com=await comP;
+const elsP=run(0,()=>osmGroups(lat,lon)).then(e=>{for(let i=0;i<4;i++)setStatus(i,!!(e&&e[i]));return e});
+/* Toutes les sources en parallèle ; `safe` garantit qu'un échec → null. */
+const out=await Promise.all([
+elsP,
+run(5,()=>air(lat,lon)),run(6,()=>pollens(lat,lon)),run(7,()=>uv(lat,lon)),
+run(8,()=>eau(com&&com.code)),
+run(9,()=>risques(lat,lon,com&&com.code)),
+run(10,()=>altitude(lat,lon)),run(11,()=>climat(lat,lon)),run(12,()=>dvf(lat,lon)),run(13,()=>urbanisme(lat,lon)),run(14,()=>nature(lat,lon)),
+]);
+const els=out[0];
+D={com,els,air:out[1],pol:out[2],uv:out[3],eau:out[4],risq:out[5],extra:{alt:out[6],clim:out[7],dvf:out[8],plu:out[9],nat:out[10]},status};
+if(status.slice(0,4).every(s=>s.ok))cache.set(key,D); /* cache seulement si OSM a bien répondu */
+}
+if(id!==rid)return; /* une recherche plus récente a démarré : abandon silencieux */
+const S=compute(lat,lon,D,$('prof').value),nm=label||(D.com?D.com.nom:'Point sélectionné');
+last={S,D,lat,lon,name:nm,label};
+marker.setIcon(pin(S.total));marker.bindPopup(esc(nm)+(S.total==null?'':' : '+S.total+'/100'));
+saveHist(nm,S,lat,lon);
+history.replaceState(null,'','#'+key); /* URL partageable : .../#lat,lon */
+render();
+}catch(e){if(id===rid)$('summary').innerHTML='<div class="msg">Le calcul a échoué. Vérifiez votre connexion puis réessayez.</div>'}
+}
+/* Clic sur la carte = évaluer ce point. */
+map.on('click',e=>load(e.latlng.lat,e.latlng.lng));
+
+/* ======================================================================
+   8) RECHERCHE (géocodage en cascade)
+   ====================================================================== */
+const sg={};let tm; /* sg : suggestions mémorisées ; tm : debounce de la saisie */
+/* Nominatim : dernier recours si IGN et geo.api ne trouvent rien. */
+async function nominatim(q,n){try{const d=await J(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&countrycodes=fr&format=json&limit=${n}&addressdetails=0`,{},10000);return d.map(x=>({label:x.display_name.split(',').slice(0,3).join(', '),lon:+x.lon,lat:+x.lat}))}catch(e){return[]}}
+/* Cascade : 1) Géocodage IGN  2) communes geo.api  3) Nominatim. */
+async function geocode(q,n=6){
+try{const d=await J(`https://data.geopf.fr/geocodage/search?q=${encodeURIComponent(q)}&limit=${n}`,{},10000);
+const f=(d.features||[]).map(x=>({label:x.properties.label,lon:x.geometry.coordinates[0],lat:x.geometry.coordinates[1]}));if(f.length)return f}catch(e){}
+try{const d=await J(`https://geo.api.gouv.fr/communes?nom=${encodeURIComponent(q)}&fields=centre&boost=population&limit=${n}`,{},10000);
+const f=d.map(x=>({label:x.nom,lon:x.centre.coordinates[0],lat:x.centre.coordinates[1]}));if(f.length)return f}catch(e){}
+return nominatim(q,n);
+}
+/* Autocomplétion (350 ms de debounce, 3 caractères minimum). */
+$('search').addEventListener('input',()=>{clearTimeout(tm);const q=$('search').value.trim();if(q.length<3)return;
+tm=setTimeout(async()=>{const f=await geocode(q);$('sugg').innerHTML='';f.forEach(x=>{sg[x.label]=x;const o=document.createElement('option');o.value=x.label;$('sugg').appendChild(o)})},350)});
+/* Bouton "Chercher" / touche Entrée. */
+async function go(){
+const q=$('search').value.trim();if(!q)return;
+const f=sg[q]?[sg[q]]:await geocode(q,1);
+if(!f.length){$('summary').innerHTML='<div class="msg">Lieu introuvable. Essayez un nom de ville ou une adresse en France.</div>';return}
+load(f[0].lat,f[0].lon,f[0].label);
+}
+$('bGo').onclick=go;
+$('search').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+/* Géolocalisation navigateur (HTTPS requis). */
+$('bGeo').onclick=()=>{
+if(!navigator.geolocation){$('summary').innerHTML='<div class="msg">Géolocalisation indisponible sur ce navigateur.</div>';return}
+navigator.geolocation.getCurrentPosition(p=>load(p.coords.latitude,p.coords.longitude),()=>{$('summary').innerHTML='<div class="msg">Position refusée ou indisponible (HTTPS requis).</div>'},{timeout:10000});
+};
+/* URL partageable : recharge si on ouvre/revient sur un lien #lat,lon. */
+window.addEventListener('hashchange',()=>{const h=location.hash.match(/^#(-?\d+\.\d+),(-?\d+\.\d+)$/);if(h)load(+h[1],+h[2])});
+const h=location.hash.match(/^#(-?\d+\.\d+),(-?\d+\.\d+)$/);
+if(h)load(+h[1],+h[2]);
+</script>
+</body>
+</html>
