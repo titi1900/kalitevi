@@ -283,6 +283,72 @@ const commune=async(lat,lon)=>{const d=await J(`https://geo.api.gouv.fr/communes
 
 /* --- Overpass : 2 requêtes simultanées maximum (limite des serveurs publics), rotation des miroirs,
    pause croissante. ovpErr garde la dernière cause d'échec pour l'afficher dans « Sources ». --- */
+
+/* ===== Sources complémentaires (logement, fiscalité, numérique, culture, bruit aérien) — hors score ===== */
+const cLayer=L.layerGroup().addTo(map); /* contour de la commune */
+const ods=(base,ds,where,x='')=>J(`${base}/api/explore/v2.1/catalog/datasets/${ds}/records?where=${encodeURIComponent(where)}${x}`,{},15000);
+const num=v=>{const n=parseFloat(String(v).replace(',','.'));return isFinite(n)?n:null};
+const fk=(o,re,pre)=>Object.keys(o||{}).find(h=>re.test(h)&&(!pre||pre.test(h))&&num(o[h])!=null);
+const latest=r=>r.slice().sort((a,b)=>{const k=x=>Object.keys(x).find(h=>/^(exercice|annee|année|an|millesime)$/i.test(h)),ka=k(a);return ka?(num(b[ka])||0)-(num(a[ka])||0):0})[0];
+async function loyers(code){ /* Carte des loyers (data.gouv.fr, API tabulaire) */
+const d=await J(`https://tabular-api.data.gouv.fr/api/resources/b539954c-43d7-450b-8c42-22b444c77246/data/?INSEE_C__exact=${code}`,{},15000);
+const r=d&&d.data;if(!r)return null;if(!r.length)return 'pas de loyer estimé pour cette commune';
+return r.slice(0,3).map(x=>{const k=fk(x,/loy/i);return k?`${num(x[k]).toFixed(1).replace('.',',')} €/m² charges comprises${x.TYPPRED?' ('+String(x.TYPPRED).replace(/^maille_?/i,'')+')':''}`:null}).filter(Boolean).join(' ; ')||'données reçues, colonnes non reconnues';
+}
+async function dpe(code){ /* DPE ADEME : répartition des étiquettes sur un échantillon de 200 logements */
+const d=await J(`https://data.ademe.fr/data-fair/api/v1/datasets/dpe-v2-logements-existants/lines?q=${code}&q_fields=${encodeURIComponent('Code_INSEE_(BAN)')}&size=200`,{},20000);
+const r=d&&d.results;if(!r)return null;if(!r.length)return 'aucun diagnostic trouvé';
+const k=Object.keys(r[0]).find(h=>/etiquette_dpe/i.test(h));if(!k)return `${r.length} diagnostics (champ étiquette non reconnu)`;
+const c={};r.forEach(x=>{const e=String(x[k]||'').trim().toUpperCase();if(/^[A-G]$/.test(e))c[e]=(c[e]||0)+1});
+const n=Object.values(c).reduce((a,b)=>a+b,0);if(!n)return null;
+return `${'ABCDEFG'.split('').filter(l=>c[l]).map(l=>l+' '+Math.round(c[l]/n*100)+' %').join(', ')} (échantillon de ${n}) ; passoires F-G : ${Math.round(((c.F||0)+(c.G||0))/n*100)} %`;
+}
+async function fisc(code){ /* taux d'imposition locaux (DGFiP) */
+const d=await ods('https://data.economie.gouv.fr','fiscalite-locale-des-particuliers',`insee_com="${code}"`,'&limit=10');
+const r=d&&d.results;if(!r)return null;if(!r.length)return 'aucune donnée pour cette commune';
+const x=latest(r),o=[['foncier bâti',/(tfb|fonc.*b[aâ]ti)/i],['habitation (rés. secondaires)',/(thrs|habitation|_th)/i],['ordures ménagères',/(teom|ordures)/i]].map(([l,re])=>{const k=fk(x,/taux/i,re);return k?`${l} ${num(x[k]).toFixed(2).replace('.',',')} %`:null}).filter(Boolean);
+return o.length?o.join(', '):'données reçues, taux non reconnus';
+}
+async function compt(code){ /* comptes des communes (DGFiP) */
+const d=await ods('https://data.economie.gouv.fr','comptes-individuels-des-communes-fichier-global',`insee="${code}"`,'&limit=10');
+const r=d&&d.results;if(!r)return null;if(!r.length)return 'aucune donnée';
+const x=latest(r),f=(l,re)=>{const k=fk(x,re);return k?`${l} ${Math.round(num(x[k])).toLocaleString('fr-FR')} €/hab.`:null};
+const o=[f('dette',/dette.*hab|encours.*hab|hab.*dette/i),f('dépenses d’équipement',/equip.*hab|hab.*equip/i),f('CAF',/caf.*hab|autofin.*hab/i)].filter(Boolean);
+return o.length?o.join(', '):'données reçues, champs non reconnus';
+}
+async function fibre(code){ /* couverture fibre (ARCEP) */
+const d=await ods('https://data.arcep.fr','le-marche-du-haut-et-tres-haut-debit-fixe-deploiements',`code_insee="${code}"`,'&limit=10');
+const r=d&&d.results;if(!r)return null;if(!r.length)return 'aucune donnée';
+const x=latest(r),k=fk(x,/(taux|part|couv).*ftth|ftth.*(taux|part|couv)/i);
+if(k){let v=num(x[k]);if(v<=1)v*=100;return `FttH : ${Math.round(v)} % des locaux`}
+const a=fk(x,/ftth/i),b=fk(x,/^(locaux|nb_locaux|total_locaux|racc)/i);
+return a&&b&&num(x[b])?`FttH : ${Math.round(num(x[a])/num(x[b])*100)} % des locaux`:'données reçues, champs non reconnus';
+}
+async function culture(code){ /* musées de France */
+const d=await ods('https://data.culture.gouv.fr','liste-des-musees-de-france',`code_insee_commune="${code}"`,'&limit=20');
+const r=d&&d.results;if(!r)return null;if(!r.length)return 'aucun musée de France dans la commune';
+const nm=x=>{const k=Object.keys(x).find(h=>/^nom/i.test(h)&&typeof x[h]==='string');return k?x[k]:null};
+return `${r.length} musée(s) de France${nm(r[0])?' : '+r.slice(0,3).map(nm).filter(Boolean).join(', '):''}`;
+}
+async function irve(code){ /* bornes de recharge (base nationale IRVE) */
+const d=await ods('https://odre.opendatasoft.com','bornes-irve',`code_insee_commune="${code}"`,'&limit=1');
+return d&&d.total_count!=null?d.total_count+' point(s) de recharge dans la commune':null;
+}
+async function radon(code){ /* potentiel radon (Géorisques) */
+const d=await J(`https://georisques.gouv.fr/api/v1/radon?code_insee=${code}`,{},12000);
+const r=d&&d.data&&d.data[0];return r?'classe '+(r.classe_potentiel??'?')+' (1 faible, 3 élevé)':d?'non renseigné':null;
+}
+async function peb(lat,lon){ /* plans d'exposition au bruit des aéroports (IGN, WFS) dans 1 km */
+const e=.01,d=await J(`https://data.geopf.fr/wfs/ows?service=WFS&version=2.0.0&request=GetFeature&typeName=TRANSPORTS.PEB:peb&outputFormat=application/json&count=20&srsName=EPSG:4326&bbox=${lat-e},${lon-e},${lat+e},${lon+e},urn:ogc:def:crs:EPSG::4326`,{},15000);
+const f=d&&d.features;if(!f)return null;if(!f.length)return 'hors plan d’exposition au bruit à moins de 1 km';
+const p=f[0].properties||{},z=p.zone||p.zone_bruit||p.type_zone||p.libelle||'';
+return 'à proximité d’un plan d’exposition au bruit d’aéroport'+(z?' (zone '+z+')':'');
+}
+async function contour(code){ /* contour de la commune à dessiner sur la carte */
+const d=await J(`https://geo.api.gouv.fr/communes/${code}?fields=nom,contour&format=geojson&geometry=contour`,{},15000);
+return d&&d.geometry?d:null;
+}
+
 let ovpErr='',ovpEnd=0; /* ovpEnd : heure limite de toute la phase OSM */
 async function ovp(body,mi=0,tries=3){
 for(let a=0;a<tries;a++){
@@ -529,7 +595,7 @@ const chips=['Tous',...Object.keys(TH)].map(t=>`<span class="chip ${t===flt?'on'
 const vis=S.res.filter(r=>flt==='Tous'||r.x.t===flt);
 const rows=vis.map(r=>r.score==null?`<tr class="na"><td>${esc(r.x.l)}${r.info?'<div class="mut">'+esc(r.info)+'</div>':''}</td><td>n/d</td><td>–</td><td>–</td></tr>`
 :`<tr><td>${esc(r.x.l)}<div class="mut">${esc(r.info)}</div></td><td class="${cls(r.score)}"><b>${r.score}</b></td><td>${r.ew.toFixed(1)} %</td><td>${r.contrib.toFixed(1)}</td></tr>`).join('');
-const c=D.com,E=D.extra,kv=(a,b)=>b==null||b===''?'':`<div class="kv"><span>${a}</span><span>${esc(b)}</span></div>`;
+const c=D.com,E=D.extra,X=D.extra2||{},kv=(a,b)=>b==null||b===''?'':`<div class="kv"><span>${a}</span><span>${esc(b)}</span></div>`;
 $('detail').innerHTML=`<div class="chips">${chips}</div>
 <div class="sec"><h3>Scores par thème</h3>${Object.keys(TH).map(t=>`<div class="th"><span>${t}</span><div class="bar"><i style="width:${S.themes[t]||0}%;background:${S.themes[t]==null?'#cbd5d3':col(S.themes[t])}"></i></div><b>${S.themes[t]??'–'}</b></div>`).join('')}
 <p class="mut" style="margin:6px 0 0">Cliquez sur un thème pour filtrer les POI correspondants sur la carte.</p></div>
@@ -548,8 +614,10 @@ ${kv('Espaces naturels protégés',E.nat)}
 ${kv('Coordonnées',lat.toFixed(4)+', '+lon.toFixed(4))}
 ${E.clim?`<p class="mut" style="margin:6px 0 0">Climat ${esc(E.clim)}</p>`:''}</div>
 ${renderCmp()}
+${Object.values(X).some(Boolean)?`<div class="sec"><h3>Logement, fiscalité et vie locale (hors score)</h3>
+${kv('Loyers',X.loyers)}${kv('Performance énergétique (DPE)',X.dpe)}${kv('Fiscalité locale',X.fisc)}${kv('Finances de la commune',X.compt)}${kv('Fibre optique',X.fibre)}${kv('Culture',X.culture)}${kv('Bornes de recharge (IRVE)',X.irve)}${kv('Radon',X.radon)}${kv('Bruit aérien (PEB)',X.peb)}</div>`:''}
 <div class="sec"><h3>Sources</h3>${D.status.map(s=>`<div class="kv"><span>${esc(s.name)}</span><span class="${s.ok==null?'':s.ok?'ok':'ko'}">${s.ok==null?'… en cours':s.ok?'✓ reçu':'✗ indisponible'}${s.why?' ('+esc(s.why)+')':''}</span></div>`).join('')}
-<p class="mut">APIs 100 % ouvertes, sans clé : Géoportail/IGN, geo.api.gouv, Hub’Eau, Géorisques, Overpass/OSM, Open-Meteo, DVF (data.gouv.fr / Cerema), Éducation nationale, Nominatim. Géorisques ou le cadastre peuvent être bloqués en <code>file://</code> : préférez un serveur local ou HTTPS.</p></div>
+<p class="mut">APIs 100 % ouvertes, sans clé : Géoportail/IGN, geo.api.gouv, Hub’Eau, Géorisques, Overpass/OSM, Open-Meteo, DVF (data.gouv.fr / Cerema), Éducation nationale, ADEME, DGFiP, ARCEP, ministère de la Culture, ODRÉ, Nominatim. Géorisques ou le cadastre peuvent être bloqués en <code>file://</code> : préférez un serveur local ou HTTPS.</p></div>
 <details class="sec"><summary><b>Méthode</b></summary>
 <p class="mut">Équipements OSM : 70 % distance au plus proche, 30 % nombre (rendement décroissant). Air, pollens, UV, eau, risques et calme viennent de mesures ou bases officielles. Indicateurs sans donnée exclus et poids renormalisés ; l’indice de confiance est la part du poids réellement mesurée.</p>
 <p class="mut">Poids de base ≈ Services 22, Santé 20, Mobilité 15, Environnement 18, Risques 10, Commerces 12, Loisirs 5. Les profils les modulent. Ce sont des choix de conception, pas des valeurs scientifiques.</p></details>`;
@@ -590,7 +658,7 @@ map.setView([lat,lon],Math.max(map.getZoom(),14));
 $('summary').innerHTML='<p class="mut">Calcul en cours…</p>';
 $('detail').innerHTML='';poiLayer.clearLayers();
 /* Ordre = ordre des sources dans le tableau `status` (l'affichage §Chargement). */
-const names=['Équipements OSM : services et santé','Équipements OSM : mobilité','Équipements OSM : commerces, loisirs, nature','Voies bruyantes (OSM)','Commune (geo.api.gouv.fr)','Qualité de l’air (Open-Meteo/CAMS)','Pollens (Open-Meteo)','Index UV (Open-Meteo)','Eau potable (Hub’Eau)','Risques (Géorisques)','Altitude (Open-Meteo)','Climat (Open-Meteo)','Prix immobilier (DVF Cerema)','Urbanisme (Géoportail de l’urbanisme)','Zones naturelles protégées (API Carto IGN)','Établissements scolaires (Éducation nationale)','Relief (Open-Meteo)'];
+const names=['Équipements OSM : services et santé','Équipements OSM : mobilité','Équipements OSM : commerces, loisirs, nature','Voies bruyantes (OSM)','Commune (geo.api.gouv.fr)','Qualité de l’air (Open-Meteo/CAMS)','Pollens (Open-Meteo)','Index UV (Open-Meteo)','Eau potable (Hub’Eau)','Risques (Géorisques)','Altitude (Open-Meteo)','Climat (Open-Meteo)','Prix immobilier (DVF Cerema)','Urbanisme (Géoportail de l’urbanisme)','Zones naturelles protégées (API Carto IGN)','Établissements scolaires (Éducation nationale)','Relief (Open-Meteo)','Loyers (carte des loyers, data.gouv.fr)','DPE (ADEME)','Fiscalité locale (DGFiP)','Finances communales (DGFiP)','Fibre (ARCEP)','Culture (musées de France)','Bornes IRVE (ODRÉ)','Radon (Géorisques)','Bruit aérien PEB (IGN)','Contour communal (geo.api.gouv.fr)'];
 const status=names.map(n=>({name:n,ok:null}));let shown=false;
 /* setStatus : met à jour la liste des sources (… en cours, ✓ reçu, ✗ indisponible). */
 const setStatus=(i,ok)=>{status[i].ok=ok;if(id===rid&&!shown){$('detail').innerHTML=`<div class="sec"><h3>Chargement des sources…</h3><div id="loadlist">${status.map(s=>`<div class="${s.ok==null?'wait':s.ok?'ok':'ko'}">${s.ok==null?'…':s.ok?'✓':'✗'} ${esc(s.name)}${s.why?' – '+esc(s.why):''}</div>`).join('')}</div></div>${renderCmp()}`}};
@@ -599,7 +667,7 @@ let D=cache.get(key);
 if(!D){
 const comP=safe(commune(lat,lon)).then(v=>{setStatus(4,v!=null);return v});
 const run=(i,f)=>Promise.resolve().then(f).then(v=>{setStatus(i,v!=null);return v},e=>{status[i].why=e&&e.name==='AbortError'?'délai dépassé':(e&&e.message)||'erreur';setStatus(i,false);return null});
-const com=await comP;
+const com=await comP,cd=com&&com.code;
 const exp=[1,2,3].map(n=>I.filter(x=>x.q&&GRP[x.t]===n).length);
 const elsP=run(0,()=>osmGroups(lat,lon)).then(e=>{for(let i=0;i<4;i++){const ok=!!(e&&e[i]);status[i].why=ok?(i<3&&e[i].ids&&e[i].ids.size<exp[i]?'partiel':''):ovpErr;setStatus(i,ok)}return e});
 /* Toutes les sources en parallèle ; `safe` garantit qu'un échec → null. */
@@ -609,9 +677,12 @@ run(5,()=>air(lat,lon)),run(6,()=>pollens(lat,lon)),run(7,()=>uv(lat,lon)),
 run(8,()=>eau(com&&com.code)),
 run(9,()=>risques(lat,lon,com&&com.code)),
 run(10,()=>altitude(lat,lon)),run(11,()=>climat(lat,lon)),run(12,()=>dvf(lat,lon,com)),run(13,()=>urbanisme(lat,lon)),run(14,()=>nature(lat,lon)),run(15,()=>education(lat,lon)),run(16,()=>relief(lat,lon)),
+run(17,()=>cd?loyers(cd):null),run(18,()=>cd?dpe(cd):null),run(19,()=>cd?fisc(cd):null),run(20,()=>cd?compt(cd):null),run(21,()=>cd?fibre(cd):null),
+run(22,()=>cd?culture(cd):null),run(23,()=>cd?irve(cd):null),run(24,()=>cd?radon(cd):null),run(25,()=>peb(lat,lon)),run(26,()=>cd?contour(cd):null),
 ]);
+cLayer.clearLayers();if(out[22]&&id===rid)L.geoJSON(out[22],{style:{color:'#0b6e6e',weight:2,fill:false,dashArray:'5 5'}}).addTo(cLayer);
 let late=null;
-D={com,els:[null,null,null,null],pending:true,air:out[1],pol:out[2],uv:out[3],eau:out[4],risq:out[5],extra:{alt:out[6],clim:out[7],dvf:out[8],plu:out[9],nat:out[10],relief:out[12],edu:eduTxt(out[11])},edu:out[11],status};
+D={com,els:[null,null,null,null],pending:true,air:out[1],pol:out[2],uv:out[3],eau:out[4],risq:out[5],extra:{alt:out[6],clim:out[7],dvf:out[8],plu:out[9],nat:out[10],relief:out[12],edu:eduTxt(out[11])},edu:out[11],extra2:{loyers:out[13],dpe:out[14],fisc:out[15],compt:out[16],fibre:out[17],culture:out[18],irve:out[19],radon:out[20],peb:out[21]},status};
 late=elsP.then(e=>{D.els=e;D.pending=false;if(status.slice(0,4).every(s=>s.ok&&!s.why))cache.set(key,D); /* cache seulement si OSM a bien répondu */});
 D.late=late;
 }
