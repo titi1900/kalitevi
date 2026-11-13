@@ -208,7 +208,7 @@ Senior:{pharmacie:1.8,medecin:1.8,hopital:1.8,arret:1.6,calme:1.8,vert:1.3,velo:
 Étudiant:{arret:1.8,velo:2,resto:2.5,culture:2.5,super:1.3,pharmacie:.7,medecin:.6,hopital:.5,ecole:.2,creche:.1,jeux:.2}};
 
 /* Miroirs Overpass : rotation automatique en cas d'échec ou de timeout. */
-const OVP=['https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+const OVP=['https://overpass-api.de/api/interpreter','https://overpass.openstreetmap.fr/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
 
 /* Fonds de carte IGN (Géoplateforme, WMTS, sans clé) + OSM. */
 const IGN=(l,f)=>`https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&LAYER=${l}&FORMAT=${f}&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}`;
@@ -245,11 +245,18 @@ return m}
 let ctl=null,rid=0,flt='Tous',last=null;const cache=new Map(),hist=new Map();
 try{JSON.parse(localStorage.getItem('kalitevi-hist')||'[]').forEach(h=>hist.set(h.k,h))}catch(e){}
 
-/* J : fetch JSON avec timeout (ms) et annulation si une nouvelle recherche démarre. */
-async function J(u,o={},ms=25000){
+/* J : fetch avec timeout, annulation, et relance automatique (tries, sauf erreurs 400/401/403/404).
+   o.text=1 → réponse texte (CSV) au lieu de JSON. */
+async function J(u,o={},ms=25000,tries=2){
+const{text,...oo}=o;let err;
+for(let a=0;a<tries;a++){
 const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
 if(ctl)ctl.signal.addEventListener('abort',()=>c.abort());
-try{const r=await fetch(u,{...o,signal:c.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}finally{clearTimeout(t)}
+try{const r=await fetch(u,{...oo,signal:c.signal});if(!r.ok)throw new Error('HTTP '+r.status);return text?await r.text():await r.json()}
+catch(e){err=e;if(ctl&&ctl.signal.aborted)throw e;if(/HTTP (400|401|403|404)/.test(e.message))throw e;await sleep(700)}
+finally{clearTimeout(t)}
+}
+throw err;
 }
 const safe=p=>p.catch(()=>null);        /* une source en échec ne bloque jamais les autres */
 const med=a=>{a=a.slice().sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:null}; /* médiane */
@@ -274,21 +281,42 @@ function drawHist(){histLayer.clearLayers();hist.forEach(h=>{if(last&&h.k===last
 /* --- Commune : nom, code INSEE, population, surface, EPCI, région --- */
 const commune=async(lat,lon)=>{const d=await J(`https://geo.api.gouv.fr/communes?lat=${lat}&lon=${lon}&fields=nom,code,population,surface,codesPostaux,departement,region,epci&format=json`);return d&&d[0]||null};
 
-/* --- Overpass : essaye chaque miroir (6 tentatives au total, pause croissante). --- */
-async function ovp(body){
-for(let a=0;a<6;a++){
-try{const d=await J(OVP[a%OVP.length]+'?data='+encodeURIComponent(body),{},40000);
-if(d&&d.elements&&!(d.remark&&/timed out|out of memory/i.test(d.remark)&&!d.elements.length))return d.elements}
-catch(e){if(ctl.signal.aborted)throw e}
-await sleep(900+a*900);
+/* --- Overpass : 2 requêtes simultanées maximum (limite des serveurs publics), rotation des miroirs,
+   pause croissante. ovpErr garde la dernière cause d'échec pour l'afficher dans « Sources ». --- */
+let ovpErr='',ovpEnd=0; /* ovpEnd : heure limite de toute la phase OSM */
+async function ovp(body,mi=0,tries=3){
+for(let a=0;a<tries;a++){
+const left=ovpEnd-Date.now();if(left<4000){ovpErr=ovpErr||'délai global dépassé';return null}
+try{const d=await J(OVP[(a+mi)%OVP.length]+'?data='+encodeURIComponent(body),{},Math.min(25000,left-500),1);
+if(d&&d.elements&&!(d.remark&&/timed out|out of memory|runtime error/i.test(d.remark)&&!d.elements.length))return d.elements;
+ovpErr='serveur surchargé'}
+catch(e){if(ctl.signal.aborted)throw e;ovpErr=/429/.test(e.message)?'trop de requêtes (429)':/HTTP 50\d/.test(e.message)?'serveur saturé ('+e.message+')':e.name==='AbortError'?'délai dépassé':e.message}
+await sleep(Math.min(1200+a*1200,Math.max(0,ovpEnd-Date.now()-4000)));
 }
 return null;
 }
-/* osmGroups : 4 requêtes en parallèle — une par GRP (équipements), une pour le bruit. */
-function osmGroups(lat,lon){
-const mk=g=>{const it=I.filter(x=>x.q&&GRP[x.t]===g);return ovp(`[out:json][timeout:30];(${it.map(x=>x.q.map(([k,...v])=>`nwr["${k}"~"^(${v.join('|')})$"](around:${x.r},${lat},${lon});`).join('')).join('')});out center tags;`)};
-const noise=ovp(`[out:json][timeout:30];(way["highway"~"^(motorway|trunk|primary)$"](around:500,${lat},${lon});way["railway"="rail"](around:500,${lat},${lon}););out geom tags;`);
-return Promise.all([mk(1),mk(2),mk(3),noise].map(safe));
+const stmts=(it,lat,lon)=>it.map(x=>x.q.map(([k,...v])=>`nwr["${k}"${v.length>1?`~"^(${v.join('|')})$"`:`="${v[0]}"`}](around:${x.r},${lat},${lon});`).join('')).join('');
+/* ovpItems : interroge un lot d'indicateurs ; si le lot échoue, il est coupé en deux et chaque moitié est retentée
+   (succès partiel possible : els.ids = indicateurs réellement obtenus). */
+async function ovpItems(it,lat,lon,mi,tries=3){
+const els=await ovp(`[out:json][timeout:25];(${stmts(it,lat,lon)});out center tags qt;`,mi,tries);
+if(els){els.ids=new Set(it.map(x=>x.id));return els}
+if(it.length<2||tries<3)return null; /* une seule coupure, pas de récursion */
+const h=it.length>>1,a=await ovpItems(it.slice(0,h),lat,lon,mi+1,2),b=await ovpItems(it.slice(h),lat,lon,mi+2,2);
+if(!a&&!b)return null;
+const r=[...(a||[]),...(b||[])];r.ids=new Set([...(a?a.ids:[]),...(b?b.ids:[])]);return r;
+}
+/* Bruit : routes rapides, voies ferrées (géométrie complète) + aérodromes à moins de 4 km (centre). */
+const noiseQ=(lat,lon)=>`[out:json][timeout:25];(way["highway"~"^(motorway|trunk|primary)$"](around:500,${lat},${lon});way["railway"="rail"](around:500,${lat},${lon}););out geom tags;nwr["aeroway"="aerodrome"](around:4000,${lat},${lon});out center tags;`;
+const osmPart=new Map(); /* groupes déjà obtenus par lieu : « Relancer » ne refait que ce qui manque */
+async function osmGroups(lat,lon){
+ovpEnd=Date.now()+40000;
+const key=lat.toFixed(4)+','+lon.toFixed(4),prev=osmPart.get(key)||[],g=n=>I.filter(x=>x.q&&GRP[x.t]===n);
+const T=[()=>ovpItems(g(1),lat,lon,0),()=>ovpItems(g(2),lat,lon,1),()=>ovpItems(g(3),lat,lon,2),()=>ovp(noiseQ(lat,lon),3,3)];
+const pool=async ix=>{for(const i of ix)if(!prev[i]||(i<3&&prev[i].ids.size<g(i+1).length)){const v=await safe(T[i]());if(v)prev[i]=v}};
+await Promise.all([pool([0,2]),pool([1,3])]);
+osmPart.set(key,prev);
+return [0,1,2,3].map(i=>prev[i]||null);
 }
 
 /* --- Qualité de l'air : IQEA européen (Open-Meteo, modèle CAMS). Score = 100 - 0.9*IQEA. --- */
@@ -314,12 +342,14 @@ const q=d&&d.daily;if(!q||q.uv_index_max==null)return null;
 const uvv=q.uv_index_max[0];
 return{score:Math.round(clamp(100-Math.max(0,uvv-6)*12)),info:`index UV max ${uvv} aujourd'hui, ${Math.round((q.sunshine_duration||[0])[0]/3600)} h d'ensoleillement`};
 }
-/* --- Eau potable : % d'analyses conformes (Hub'Eau, code INSEE requis). --- */
+/* --- Eau potable : % d'analyses conformes (Hub'Eau, code INSEE). Une commune sans analyse publiée donne
+   « n/d » avec explication (et non une panne de source). --- */
 async function eau(code){
 if(!code)return null;
-const d=await J(`https://hubeau.eaufrance.fr/api/v1/qualite_eau_potable/resultats_dis?code_commune=${code}&size=200&fields=date_prelevement,conformite_limites_bact_prelevement,conformite_limites_pc_prelevement`);
+const y=new Date().getFullYear(),u=`https://hubeau.eaufrance.fr/api/v1/qualite_eau_potable/resultats_dis?code_commune=${code}&size=300&fields=date_prelevement,conformite_limites_bact_prelevement,conformite_limites_pc_prelevement`;
+let d;try{d=await J(u+`&date_min_prelevement=${y-1}-01-01`)}catch(e){d=await J(u)}
 let ok=0,n=0;((d&&d.data)||[]).forEach(r=>[r.conformite_limites_bact_prelevement,r.conformite_limites_pc_prelevement].forEach(v=>{if(v==='C'){ok++;n++}else if(v==='N')n++}));
-return n?{score:Math.round(100*ok/n),info:`${Math.round(100*ok/n)} % des analyses conformes (${n} paramètres)`}:null;
+return n?{score:Math.round(100*ok/n),info:`${Math.round(100*ok/n)} % des analyses conformes (${n} paramètres)`}:{score:null,info:'aucune analyse récente publiée pour cette commune'};
 }
 /* --- Risques : rapport Géorisques + ICPE (3 km) + arrêtés CatNat (code INSEE). --- */
 async function risques(lat,lon,code){
@@ -342,13 +372,52 @@ const q=d&&d.daily;if(!q||!q.time)return null;
 const n=q.time.length,sum=a=>a.reduce((s,v)=>s+(v||0),0);
 return`${y} : ${(sum(q.temperature_2m_max.map((v,i)=>(v+q.temperature_2m_min[i])/2))/n).toFixed(1)} °C en moyenne, ${q.temperature_2m_max.filter(v=>v>=30).length} jours ≥ 30 °C, ${q.temperature_2m_min.filter(v=>v<=0).length} jours de gel, ${Math.round(sum(q.precipitation_sum))} mm, ${Math.round(sum(q.sunshine_duration)/3600)} h de soleil`;
 }
-/* --- Prix immobilier : ventes DVF (Cerema) dans un carré ~650 m, €/m² médian. --- */
-async function dvf(lat,lon){
+/* --- Prix immobilier : fichiers DVF officiels par commune (data.gouv.fr, 3 dernières années),
+   médiane €/m² des ventes d'un seul bien (maison ou appartement) autour du point ; repli : API Cerema. --- */
+function csvRows(t){const L=t.split('\n'),h=L[0].replace('\r','').split(',');
+return L.slice(1).filter(l=>l.trim()).map(l=>{const c=[];let s='',q=false;for(const ch of l){if(ch==='"')q=!q;else if(ch===','&&!q){c.push(s);s=''}else s+=ch}c.push(s.replace('\r',''));const o={};h.forEach((k,i)=>o[k]=c[i]);return o})}
+async function dvf(lat,lon,com){
+if(com&&com.code){
+const dep=com.code.startsWith('97')?com.code.slice(0,3):com.code.slice(0,2),Y=new Date().getFullYear();let rows=[];
+for(const y of [Y-1,Y-2,Y-3]){try{rows=rows.concat(csvRows(await J(`https://files.data.gouv.fr/geo-dvf/latest/csv/${y}/communes/${dep}/${com.code}.csv`,{text:1},30000,1)))}catch(e){if(ctl.signal.aborted)throw e}}
+if(rows.length){
+const by={};rows.forEach(r=>{(by[r.id_mutation]=by[r.id_mutation]||[]).push(r)});
+const S=[];
+Object.values(by).forEach(g=>{const b=g.filter(r=>/^(Maison|Appartement)$/.test(r.type_local)&&+r.surface_reelle_bati>9);
+if(g[0].nature_mutation!=='Vente'||b.length!==1)return;
+const pr=(+g[0].valeur_fonciere)/(+b[0].surface_reelle_bati);
+if(pr>300&&pr<30000&&b[0].latitude)S.push({pr,t:b[0].type_local,d:dist(lat,lon,+b[0].latitude,+b[0].longitude)})});
+let r=1000,sel=S.filter(x=>x.d<=r);if(sel.length<8){r=2500;sel=S.filter(x=>x.d<=r)}
+let lab='rayon '+r/1000+' km';if(sel.length<8){sel=S;lab='toute la commune'}
+const f=t=>{const a=sel.filter(x=>x.t===t).map(x=>x.pr);return a.length>=3?`${t==='Maison'?'maisons':'appartements'} ${Math.round(med(a)).toLocaleString('fr-FR')} €/m² (${a.length} ventes)`:''};
+const o=[f('Appartement'),f('Maison')].filter(Boolean).join(' ; ');
+return o?`${o}, médiane ${Y-3}-${Y-1}, ${lab}`:'trop peu de ventes exploitables (DVF)';
+}}
+return dvfCerema(lat,lon);
+}
+async function dvfCerema(lat,lon){
 const dy=.006,dx=dy/Math.cos(lat*Math.PI/180);
 const d=await J(`https://apidf-preprod.cerema.fr/dvf_opendata/geomutations/?in_bbox=${lon-dx},${lat-dy},${lon+dx},${lat+dy}&anneemut_min=2022&page_size=500`);
 const f=(d&&(d.features||(d.results&&d.results.features)))||[];
 const p=f.map(x=>{const q=x.properties||{},v=parseFloat(q.valeurfonc),s=(parseFloat(q.sbatapt)||0)+(parseFloat(q.sbatmai)||0);return s>9?v/s:null}).filter(v=>v&&v>300&&v<30000);
-return p.length>=3?`${Math.round(med(p)).toLocaleString('fr-FR')} €/m² médian (${p.length} ventes depuis 2022, rayon 650 m)`:null;
+return p.length>=3?`${Math.round(med(p)).toLocaleString('fr-FR')} €/m² médian (${p.length} ventes depuis 2022, rayon 650 m)`:'trop peu de ventes exploitables (DVF)';
+}
+/* --- Établissements scolaires (Annuaire de l'éducation nationale, data.education.gouv.fr, 2,5 km).
+   Sert aussi de secours à l'indicateur « Écoles » quand Overpass ne répond pas. --- */
+async function education(lat,lon){
+const w=encodeURIComponent(`within_distance(position, geom'POINT(${lon} ${lat})', 2500m)`);
+const d=await J(`https://data.education.gouv.fr/api/explore/v2.1/catalog/datasets/fr-en-annuaire-education/records?where=${w}&select=nom_etablissement,type_etablissement,latitude,longitude&limit=100`,{},15000);
+if(!d||!d.results)return null;
+return d.results.filter(r=>r.latitude!=null).map(r=>({la:+r.latitude,lo:+r.longitude,name:r.nom_etablissement,type:r.type_etablissement}));
+}
+function eduTxt(l){if(!l)return null;if(!l.length)return 'aucun établissement recensé';const c={};l.forEach(e=>{const t=e.type||'Autre';c[t]=(c[t]||0)+1});return Object.entries(c).sort((a,b)=>b[1]-a[1]).map(([t,n])=>n+' '+t.toLowerCase()).join(', ')}
+/* --- Relief : pente moyenne sur 250 m autour du point (5 altitudes Open-Meteo). --- */
+async function relief(lat,lon){
+const dy=.00225,dx=dy/Math.cos(lat*Math.PI/180),P=[[lat,lon],[lat+dy,lon],[lat-dy,lon],[lat,lon+dx],[lat,lon-dx]];
+const d=await J(`https://api.open-meteo.com/v1/elevation?latitude=${P.map(p=>p[0].toFixed(5)).join(',')}&longitude=${P.map(p=>p[1].toFixed(5)).join(',')}`);
+const e=d&&d.elevation;if(!e||e.length<5)return null;
+const m=[1,2,3,4].reduce((a,i)=>a+Math.abs(e[i]-e[0])/250*100,0)/4;
+return `pente moyenne ${m.toFixed(1)} % (${m<3?'terrain plat':m<8?'légèrement vallonné':'pentu'})`;
 }
 /* --- Zonage PLU/POS au point cliqué (API Carto IGN, GPU). --- */
 async function urbanisme(lat,lon){
@@ -379,8 +448,8 @@ return Math.round(100*(.7*prox+.3*dens));
 /* calme : pénalités cumulées selon la distance de la voie rapide / ferrée / principale. */
 function calme(lat,lon,els){
 const best={};
-els.forEach(e=>{if(!e.geometry)return;const t=e.tags||{},k=t.railway?'rail':/motorway|trunk/.test(t.highway)?'fast':'prim',d=dPoly(lat,lon,e.geometry);if(!(k in best)||d<best[k])best[k]=d});
-const T={fast:[[100,60],[250,35],[500,15]],rail:[[100,40],[250,25],[500,10]],prim:[[50,20],[150,10]]},N={fast:'voie rapide',rail:'voie ferrée',prim:'route principale'};
+els.forEach(e=>{const t=e.tags||{};if(t.aeroway){const c=e.center;if(c){const d=dist(lat,lon,c.lat,c.lon);if(!('air' in best)||d<best.air)best.air=d}return}if(!e.geometry)return;const k=t.railway?'rail':/motorway|trunk/.test(t.highway)?'fast':'prim',d=dPoly(lat,lon,e.geometry);if(!(k in best)||d<best[k])best[k]=d});
+const T={fast:[[100,60],[250,35],[500,15]],rail:[[100,40],[250,25],[500,10]],prim:[[50,20],[150,10]],air:[[1500,40],[3000,20]]},N={fast:'voie rapide',rail:'voie ferrée',prim:'route principale',air:'aérodrome (centre)'};
 let p=0;const inf=[];
 Object.keys(best).forEach(k=>{const r=T[k].find(([m])=>best[k]<=m);if(r){p+=r[1];inf.push(`${N[k]} à ${Math.round(best[k])} m`)}});
 return{score:Math.round(clamp(100-p)),info:inf.length?inf.join(', '):'aucune source de bruit majeure à moins de 500 m'};
@@ -397,12 +466,17 @@ const r={x,score:null,info:'',w:x.w*(P[x.id]||1)};
 if(x.api){ /* indicateurs API : air, eau, pollens, uv, risques */
 const v=x.id==='air'?D.air:x.id==='eau'?D.eau:x.id==='pollens'?D.pol:x.id==='uv'?D.uv:D.risq&&(x.id==='rnat'?D.risq.nat:D.risq.tec);if(v){r.score=v.score;r.info=v.info}}
 else if(x.noise){const e=D.els[3];if(e){const v=calme(lat,lon,e);r.score=v.score;r.info=v.info}}
+else if(x.id==='ecole'&&D.edu&&!(D.els[0]&&D.els[0].ids&&D.els[0].ids.has('ecole'))){ /* secours : Annuaire de l'éducation nationale */
+const items=D.edu.map(e=>({...e,d:dist(lat,lon,e.la,e.lo)})).filter(e=>e.d<=x.r).sort((a,b)=>a.d-b.d);
+r.score=scoreInd(x,items);r.dmin=items.length?items[0].d:null;
+r.info=items.length?`${items.length} établissement(s) (Éducation nationale), le plus proche à ${Math.round(items[0].d)} m`:`aucun dans ${x.r/1000} km`;
+items.slice(0,10).forEach(i=>pois.push({d:i.d,la:i.la,lo:i.lo,name:i.name,theme:x.t,ind:x.l}))}
 else{ /* indicateurs OSM : filtrage des éléments par clé/valeur + distance */
 const els=D.els[GRP[x.t]-1];
-if(els){
+if(els&&(!els.ids||els.ids.has(x.id))){
 const items=[];
 els.forEach(e=>{const t=e.tags||{};if(!x.q.some(([k,...v])=>v.includes(t[k])))return;const la=e.lat??e.center?.lat,lo=e.lon??e.center?.lon;if(la==null)return;const d=dist(lat,lon,la,lo);if(d<=x.r)items.push({d,la,lo,name:t.name||x.l})});
-r.score=scoreInd(x,items);
+r.score=scoreInd(x,items);r.dmin=items.length?Math.min(...items.map(i=>i.d)):null;
 r.info=items.length?`${items.length} trouvé(s), le plus proche à ${Math.round(Math.min(...items.map(i=>i.d)))} m`:`aucun dans ${x.r>=1000?x.r/1000+' km':x.r+' m'}`;
 items.sort((a,b)=>a.d-b.d).slice(0,10).forEach(i=>pois.push({...i,theme:x.t,ind:x.l}));
 }}
@@ -413,8 +487,9 @@ const av=res.filter(r=>r.score!=null),W=av.reduce((s,r)=>s+r.w,0),WT=res.reduce(
 res.forEach(r=>{r.ew=r.score==null?0:r.w/W*100;r.contrib=r.score==null?0:r.score*r.ew/100});
 const themes={};
 Object.keys(TH).forEach(t=>{const a=av.filter(r=>r.x.t===t),w=a.reduce((s,r)=>s+r.w,0);themes[t]=w?Math.round(a.reduce((s,r)=>s+r.score*r.w,0)/w):null});
+const Q15=['super','boul','pharmacie','medecin','ecole','arret','vert','banque'],qa=res.filter(r=>Q15.includes(r.x.id)&&r.dmin!==undefined),q15=qa.length>=4?{n:qa.filter(r=>r.dmin!=null&&r.dmin<=1000).length,t:qa.length}:null;
 const sparse=D.els.slice(0,3).every(e=>e&&e.length)&&D.els.slice(0,3).reduce((s,e)=>s+e.length,0)<12;
-return{key:lat.toFixed(4)+','+lon.toFixed(4),res,pois,themes,total:W?Math.round(av.reduce((s,r)=>s+r.score*r.w,0)/W):null,conf:Math.round(W/WT*100*(sparse?.8:1)),sparse};
+return{key:lat.toFixed(4)+','+lon.toFixed(4),res,pois,q15,themes,total:W?Math.round(av.reduce((s,r)=>s+r.score*r.w,0)/W):null,conf:Math.round(W/WT*100*(sparse?.8:1)),sparse};
 }
 
 /* ======================================================================
@@ -437,12 +512,14 @@ ${[...hist.values()].reverse().map(h=>`<tr ${last&&h.k===last.S.key?'style="font
 /* render : reconstruit tout le panneau latéral à partir de `last`. */
 function render(){
 if(!last)return;
-const{S,name,D,lat,lon}=last,sc=S.total,okAll=D.status.every(s=>s.ok);
+const{S,name,D,lat,lon}=last,sc=S.total,okAll=D.status.every(s=>s.ok!==false);
 /* --- Bloc résumé : score global + confiance + avertissements --- */
 $('summary').innerHTML=`<h2 style="margin:0 0 8px;font-size:17px">KALITEVI – ${esc(name)}</h2>
 <div class="hero"><div class="big ${sc==null?'':cls(sc)}">${sc==null?'--':sc}<small>/100</small></div>
 <div style="flex:1"><div class="mut">Indice de confiance : ${S.conf} %</div><div class="conf"><i style="width:${S.conf}%"></i></div>
 <div class="mut">${sc==null?'':sc>=80?'Excellent':sc>=50?'Moyen':'Faible'} · profil ${esc($('prof').value)}</div></div></div>
+${D.pending?'<div class="msg">Équipements OpenStreetMap en cours de chargement (40 s maximum) : le score se mettra à jour tout seul.</div>':''}
+${S.q15?`<div class="mut" style="margin-top:6px">Ville du quart d’heure : <b>${S.q15.n}/${S.q15.t}</b> services essentiels à moins de 1 km à pied</div>`:''}
 ${okAll?'':'<div class="msg">Certaines sources n’ont pas répondu (voir « Sources »). Le score est calculé sur le reste. <button id="retry">Relancer</button></div>'}
 ${S.sparse?'<div class="msg">Peu de données OpenStreetMap ici : score à prendre avec prudence.</div>':''}`;
 const rb=$('retry');if(rb)rb.onclick=()=>load(lat,lon,last.label);
@@ -450,7 +527,7 @@ const cb=$('bClear');if(cb)cb.onclick=()=>{hist.clear();localStorage.removeItem(
 /* --- Détails : filtres, thèmes, contributions, contexte, historique, sources, méthode --- */
 const chips=['Tous',...Object.keys(TH)].map(t=>`<span class="chip ${t===flt?'on':''}" role="button" tabindex="0" data-t="${t}">${t}</span>`).join('');
 const vis=S.res.filter(r=>flt==='Tous'||r.x.t===flt);
-const rows=vis.map(r=>r.score==null?`<tr class="na"><td>${esc(r.x.l)}</td><td>n/d</td><td>–</td><td>–</td></tr>`
+const rows=vis.map(r=>r.score==null?`<tr class="na"><td>${esc(r.x.l)}${r.info?'<div class="mut">'+esc(r.info)+'</div>':''}</td><td>n/d</td><td>–</td><td>–</td></tr>`
 :`<tr><td>${esc(r.x.l)}<div class="mut">${esc(r.info)}</div></td><td class="${cls(r.score)}"><b>${r.score}</b></td><td>${r.ew.toFixed(1)} %</td><td>${r.contrib.toFixed(1)}</td></tr>`).join('');
 const c=D.com,E=D.extra,kv=(a,b)=>b==null||b===''?'':`<div class="kv"><span>${a}</span><span>${esc(b)}</span></div>`;
 $('detail').innerHTML=`<div class="chips">${chips}</div>
@@ -463,14 +540,16 @@ ${kv('Commune',c?`${c.nom} (${c.departement?c.departement.code:''})`:'inconnue')
 ${kv('Territoire',c&&[c.epci&&c.epci.nom,c.region&&c.region.nom].filter(Boolean).join(', '))}
 ${kv('Population',c&&c.population&&c.population.toLocaleString('fr-FR')+' hab.'+(c.surface?`, ${Math.round(c.population/(c.surface/100)).toLocaleString('fr-FR')} hab./km²`:''))}
 ${kv('Altitude',E.alt!=null?E.alt+' m':null)}
+${kv('Relief',E.relief)}
+${kv('Établissements scolaires (2,5 km)',E.edu)}
 ${kv('Prix de l’immobilier',E.dvf)}
 ${kv('Zonage d’urbanisme',E.plu)}
 ${kv('Espaces naturels protégés',E.nat)}
 ${kv('Coordonnées',lat.toFixed(4)+', '+lon.toFixed(4))}
 ${E.clim?`<p class="mut" style="margin:6px 0 0">Climat ${esc(E.clim)}</p>`:''}</div>
 ${renderCmp()}
-<div class="sec"><h3>Sources</h3>${D.status.map(s=>`<div class="kv"><span>${esc(s.name)}</span><span class="${s.ok?'ok':'ko'}">${s.ok?'✓ reçu':'✗ indisponible'}</span></div>`).join('')}
-<p class="mut">APIs 100 % ouvertes, sans clé : Géoportail/IGN, geo.api.gouv, Hub’Eau, Géorisques, Overpass/OSM, Open-Meteo, DVF (Cerema), Nominatim. Géorisques ou le cadastre peuvent être bloqués en <code>file://</code> : préférez un serveur local ou HTTPS.</p></div>
+<div class="sec"><h3>Sources</h3>${D.status.map(s=>`<div class="kv"><span>${esc(s.name)}</span><span class="${s.ok==null?'':s.ok?'ok':'ko'}">${s.ok==null?'… en cours':s.ok?'✓ reçu':'✗ indisponible'}${s.why?' ('+esc(s.why)+')':''}</span></div>`).join('')}
+<p class="mut">APIs 100 % ouvertes, sans clé : Géoportail/IGN, geo.api.gouv, Hub’Eau, Géorisques, Overpass/OSM, Open-Meteo, DVF (data.gouv.fr / Cerema), Éducation nationale, Nominatim. Géorisques ou le cadastre peuvent être bloqués en <code>file://</code> : préférez un serveur local ou HTTPS.</p></div>
 <details class="sec"><summary><b>Méthode</b></summary>
 <p class="mut">Équipements OSM : 70 % distance au plus proche, 30 % nombre (rendement décroissant). Air, pollens, UV, eau, risques et calme viennent de mesures ou bases officielles. Indicateurs sans donnée exclus et poids renormalisés ; l’indice de confiance est la part du poids réellement mesurée.</p>
 <p class="mut">Poids de base ≈ Services 22, Santé 20, Mobilité 15, Environnement 18, Risques 10, Commerces 12, Loisirs 5. Les profils les modulent. Ce sont des choix de conception, pas des valeurs scientifiques.</p></details>`;
@@ -511,28 +590,30 @@ map.setView([lat,lon],Math.max(map.getZoom(),14));
 $('summary').innerHTML='<p class="mut">Calcul en cours…</p>';
 $('detail').innerHTML='';poiLayer.clearLayers();
 /* Ordre = ordre des sources dans le tableau `status` (l'affichage §Chargement). */
-const names=['Équipements OSM : services et santé','Équipements OSM : mobilité','Équipements OSM : commerces, loisirs, nature','Voies bruyantes (OSM)','Commune (geo.api.gouv.fr)','Qualité de l’air (Open-Meteo/CAMS)','Pollens (Open-Meteo)','Index UV (Open-Meteo)','Eau potable (Hub’Eau)','Risques (Géorisques)','Altitude (Open-Meteo)','Climat (Open-Meteo)','Prix immobilier (DVF Cerema)','Urbanisme (Géoportail de l’urbanisme)','Zones naturelles protégées (API Carto IGN)'];
-const status=names.map(n=>({name:n,ok:null}));
+const names=['Équipements OSM : services et santé','Équipements OSM : mobilité','Équipements OSM : commerces, loisirs, nature','Voies bruyantes (OSM)','Commune (geo.api.gouv.fr)','Qualité de l’air (Open-Meteo/CAMS)','Pollens (Open-Meteo)','Index UV (Open-Meteo)','Eau potable (Hub’Eau)','Risques (Géorisques)','Altitude (Open-Meteo)','Climat (Open-Meteo)','Prix immobilier (DVF Cerema)','Urbanisme (Géoportail de l’urbanisme)','Zones naturelles protégées (API Carto IGN)','Établissements scolaires (Éducation nationale)','Relief (Open-Meteo)'];
+const status=names.map(n=>({name:n,ok:null}));let shown=false;
 /* setStatus : met à jour la liste des sources (… en cours, ✓ reçu, ✗ indisponible). */
-const setStatus=(i,ok)=>{status[i].ok=ok;if(id===rid){$('detail').innerHTML=`<div class="sec"><h3>Chargement des sources…</h3><div id="loadlist">${status.map(s=>`<div class="${s.ok==null?'wait':s.ok?'ok':'ko'}">${s.ok==null?'…':s.ok?'✓':'✗'} ${esc(s.name)}</div>`).join('')}</div></div>${renderCmp()}`}};
+const setStatus=(i,ok)=>{status[i].ok=ok;if(id===rid&&!shown){$('detail').innerHTML=`<div class="sec"><h3>Chargement des sources…</h3><div id="loadlist">${status.map(s=>`<div class="${s.ok==null?'wait':s.ok?'ok':'ko'}">${s.ok==null?'…':s.ok?'✓':'✗'} ${esc(s.name)}${s.why?' – '+esc(s.why):''}</div>`).join('')}</div></div>${renderCmp()}`}};
 try{
 let D=cache.get(key);
 if(!D){
 const comP=safe(commune(lat,lon)).then(v=>{setStatus(4,v!=null);return v});
-const run=(i,f)=>safe(Promise.resolve(f())).then(v=>{setStatus(i,v!=null);return v});
+const run=(i,f)=>Promise.resolve().then(f).then(v=>{setStatus(i,v!=null);return v},e=>{status[i].why=e&&e.name==='AbortError'?'délai dépassé':(e&&e.message)||'erreur';setStatus(i,false);return null});
 const com=await comP;
-const elsP=run(0,()=>osmGroups(lat,lon)).then(e=>{for(let i=0;i<4;i++)setStatus(i,!!(e&&e[i]));return e});
+const exp=[1,2,3].map(n=>I.filter(x=>x.q&&GRP[x.t]===n).length);
+const elsP=run(0,()=>osmGroups(lat,lon)).then(e=>{for(let i=0;i<4;i++){const ok=!!(e&&e[i]);status[i].why=ok?(i<3&&e[i].ids&&e[i].ids.size<exp[i]?'partiel':''):ovpErr;setStatus(i,ok)}return e});
 /* Toutes les sources en parallèle ; `safe` garantit qu'un échec → null. */
 const out=await Promise.all([
-elsP,
+null,
 run(5,()=>air(lat,lon)),run(6,()=>pollens(lat,lon)),run(7,()=>uv(lat,lon)),
 run(8,()=>eau(com&&com.code)),
 run(9,()=>risques(lat,lon,com&&com.code)),
-run(10,()=>altitude(lat,lon)),run(11,()=>climat(lat,lon)),run(12,()=>dvf(lat,lon)),run(13,()=>urbanisme(lat,lon)),run(14,()=>nature(lat,lon)),
+run(10,()=>altitude(lat,lon)),run(11,()=>climat(lat,lon)),run(12,()=>dvf(lat,lon,com)),run(13,()=>urbanisme(lat,lon)),run(14,()=>nature(lat,lon)),run(15,()=>education(lat,lon)),run(16,()=>relief(lat,lon)),
 ]);
-const els=out[0];
-D={com,els,air:out[1],pol:out[2],uv:out[3],eau:out[4],risq:out[5],extra:{alt:out[6],clim:out[7],dvf:out[8],plu:out[9],nat:out[10]},status};
-if(status.slice(0,4).every(s=>s.ok))cache.set(key,D); /* cache seulement si OSM a bien répondu */
+let late=null;
+D={com,els:[null,null,null,null],pending:true,air:out[1],pol:out[2],uv:out[3],eau:out[4],risq:out[5],extra:{alt:out[6],clim:out[7],dvf:out[8],plu:out[9],nat:out[10],relief:out[12],edu:eduTxt(out[11])},edu:out[11],status};
+late=elsP.then(e=>{D.els=e;D.pending=false;if(status.slice(0,4).every(s=>s.ok&&!s.why))cache.set(key,D); /* cache seulement si OSM a bien répondu */});
+D.late=late;
 }
 if(id!==rid)return; /* une recherche plus récente a démarré : abandon silencieux */
 const S=compute(lat,lon,D,$('prof').value),nm=label||(D.com?D.com.nom:'Point sélectionné');
@@ -540,7 +621,8 @@ last={S,D,lat,lon,name:nm,label};
 marker.setIcon(pin(S.total));marker.bindPopup(esc(nm)+(S.total==null?'':' : '+S.total+'/100'));
 saveHist(nm,S,lat,lon);
 history.replaceState(null,'','#'+key); /* URL partageable : .../#lat,lon */
-render();
+shown=true;render();
+if(D.pending&&D.late)D.late.then(()=>{if(id!==rid)return;last.S=compute(lat,lon,D,$('prof').value);marker.setIcon(pin(last.S.total));marker.bindPopup(esc(nm)+(last.S.total==null?'':' : '+last.S.total+'/100'));saveHist(nm,last.S,lat,lon);render()});
 }catch(e){if(id===rid)$('summary').innerHTML='<div class="msg">Le calcul a échoué. Vérifiez votre connexion puis réessayez.</div>'}
 }
 /* Clic sur la carte = évaluer ce point. */
